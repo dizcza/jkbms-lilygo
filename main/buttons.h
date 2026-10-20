@@ -12,11 +12,14 @@
  extern "C" {
 #endif
 
+#define BUTTON_PREV        (-1)    // left button, short press (fires on release)
+#define BUTTON_NEXT        (+1)    // right button press
+#define BUTTON_PREV_LONG   (-2)    // left button held for 1.5 s
+
 /**
- * Called from the buttons task: -1 for the left button, +1 for the right one,
- * 0 when both buttons are held for 2 seconds.
+ * Called from the buttons task with one of the BUTTON_* events.
  */
-typedef void (*buttons_cb_t)(int step);
+typedef void (*buttons_cb_t)(int event);
 
 void buttons_init(buttons_cb_t callback);
 

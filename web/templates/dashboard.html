@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JK BMS</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<header>
+  <h1>JK BMS</h1>
+  <span id="updated" class="dim"></span>
+  <a href="{{ url_for('logout') }}">Log out</a>
+</header>
+<main id="bms-list"><p class="dim">Loading...</p></main>
+<script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>

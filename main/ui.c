@@ -16,9 +16,14 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_lvgl_port.h"
-#include "esp_system.h"
+#if CONFIG_UI_SCREENSHOT_CONSOLE
+#include "others/snapshot/lv_snapshot.h"
+#endif
 #include "esp_timer.h"
+#include "buttons.h"
 #include "jkbms_ble.h"
 #include "lcd.h"
 
@@ -41,7 +46,17 @@
 #define CHART_X           4
 #define CHART_W           (LCD_H_RES - 2 * CHART_X)
 
-#define STALE_US          (15 * 1000000LL)
+#define NO_DATA_SLEEP_US  (30 * 1000000LL)
+
+#define SPINNER_SIZE      100
+
+#define SLEEP_SCREEN_US   (2 * 1000000LL)
+#define COLOR_MOON        0xFFE082
+#define COLOR_SLEEP_Z     0x90CAF9
+
+// LiFePO4 cell voltage range of the per-cell bar chart before the BMS settings arrive
+#define CHART_DEFAULT_LO  2.5f
+#define CHART_DEFAULT_HI  3.65f
 
 #define LOG_SLOTS         8          // max logbook events per page
 #define LOG_TITLE_H       26
@@ -53,8 +68,8 @@
 #define SETTINGS_MAX      32
 
 #define PICKER_ROWS       5
-#define PICKER_ROW_H      34
-#define PICKER_MAX_AGE_US (20 * 1000000LL)
+#define PICKER_HINT_H     22         // the hint line below the list
+#define PICKER_MAX_AGE_US (60 * 1000000LL)  // results of a search this recent are reused
 
 typedef enum {
     UI_MODE_PICKER,
@@ -77,6 +92,7 @@ typedef struct {
     lv_obj_t *voltage;
     lv_obj_t *voltage_unit;
     lv_obj_t *current;
+    lv_obj_t *power;
     lv_obj_t *soc_bar;
     lv_obj_t *soc;
     lv_obj_t *diff;
@@ -139,17 +155,21 @@ typedef struct {
 
 typedef struct {
     lv_obj_t *cont;
-    lv_obj_t *title;
-    lv_obj_t *state;
-    lv_obj_t *mac;
+    lv_obj_t *spinner;
+    lv_obj_t *message;
+    lv_obj_t *hint;
 } nodata_page_t;
 
 typedef struct {
     lv_obj_t *cont;
-    lv_obj_t *status;
+    lv_obj_t *spinner;
+    lv_obj_t *message;
+    lv_obj_t *message_hint;
+    lv_obj_t *list;
     lv_obj_t *rows[PICKER_ROWS];
     lv_obj_t *names[PICKER_ROWS];
-    lv_obj_t *details[PICKER_ROWS];
+    lv_obj_t *macs[PICKER_ROWS];
+    lv_obj_t *rssis[PICKER_ROWS];
     lv_obj_t *hint;
 } picker_page_t;
 
@@ -177,7 +197,13 @@ static struct {
     int found_count;
     int cursor;
     bool picker_touched;
+    bool picker_manual;      // opened by the user: always show the list
     int64_t picker_start_us;
+    // deep sleep
+    lv_obj_t *sleep_screen;
+    bool anonymize;          // screenshots: show made-up BMS names and MACs
+    int64_t last_button_us;
+    int64_t data_shown_us;   // when BMS data was first shown, 0 before
 } m_ui;
 
 extern const lv_image_dsc_t ohm_glyph;
@@ -246,20 +272,21 @@ static void create_summary_page(lv_obj_t *scr) {
     p->voltage = make_label(p->cont, &lv_font_montserrat_40, COLOR_TEXT, 4, 0);
     p->voltage_unit = make_label(p->cont, &lv_font_montserrat_28, COLOR_TEXT, 0, 0);
     lv_label_set_text(p->voltage_unit, "V");
-    p->current = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 4, 50);
+    p->current = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 4, 44);
+    p->power = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 4, 66);
 
     p->soc_bar = lv_bar_create(p->cont);
-    lv_obj_set_pos(p->soc_bar, 4, 84);
+    lv_obj_set_pos(p->soc_bar, 4, 96);
     lv_obj_set_size(p->soc_bar, 76, 16);
     lv_bar_set_range(p->soc_bar, 0, 100);
     lv_obj_set_style_bg_color(p->soc_bar, lv_color_hex(COLOR_HEADER), LV_PART_MAIN);
     lv_obj_set_style_bg_color(p->soc_bar, lv_color_hex(COLOR_OK), LV_PART_INDICATOR);
-    p->soc = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 86, 80);
+    p->soc = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 86, 92);
 
-    p->diff = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 4, 108);
-    p->charging = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 4, 134);
-    p->discharging = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 4, 160);
-    p->balancing = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 4, 186);
+    p->diff = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 4, 116);
+    p->charging = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 4, 139);
+    p->discharging = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 4, 162);
+    p->balancing = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 4, 185);
 }
 
 
@@ -344,12 +371,33 @@ static void create_log_page(lv_obj_t *scr) {
 }
 
 
+/**
+ * Spinner with an optional error message and hint below it.
+ */
+static void create_waiting(lv_obj_t *parent, lv_obj_t **spinner, lv_obj_t **message, lv_obj_t **hint) {
+    *spinner = lv_spinner_create(parent);
+    lv_spinner_set_anim_params(*spinner, 1000, 270);
+    lv_obj_set_size(*spinner, SPINNER_SIZE, SPINNER_SIZE);
+    lv_obj_set_style_arc_color(*spinner, lv_color_hex(COLOR_HEADER), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(*spinner, lv_color_hex(COLOR_OK), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(*spinner, 12, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(*spinner, 12, LV_PART_INDICATOR);
+
+    *message = make_label(parent, &lv_font_montserrat_20, COLOR_ERROR, 4, SPINNER_SIZE + 12);
+    *hint = make_label(parent, &lv_font_montserrat_14, COLOR_DIM, 4, SPINNER_SIZE + 40);
+    lv_obj_t *labels[] = { *message, *hint };
+    for (int i = 0; i < 2; i++) {
+        lv_obj_set_width(labels[i], LCD_H_RES - 8);
+        lv_label_set_long_mode(labels[i], LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(labels[i], LV_TEXT_ALIGN_CENTER, 0);
+    }
+}
+
+
 static void create_nodata_page(lv_obj_t *scr) {
     nodata_page_t *p = &m_ui.nodata;
     p->cont = make_container(scr, HEADER_H, CONTENT_H);
-    p->title = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 4, 20);
-    p->state = make_label(p->cont, &lv_font_montserrat_14, COLOR_WARN, 4, 52);
-    p->mac = make_label(p->cont, &lv_font_montserrat_14, COLOR_DIM, 4, 76);
+    create_waiting(p->cont, &p->spinner, &p->message, &p->hint);
 }
 
 
@@ -523,22 +571,19 @@ static int settings_pages(int bms) {
 
 
 /**
- * Formats logbook event n (0 = newest): its number and age, and its description.
+ * Formats logbook event n (0 = newest): its age and its description.
  */
 static void log_event_text(const jkbms_status_t *st, int n, char *time, size_t time_size, char *label,
                            size_t label_size) {
     const jkbms_log_entry_t *e = &st->logbook[st->logbook_count - 1 - n];
-    const unsigned long number = st->logbook_total - n;
     // timestamps count seconds since the BMS was first powered, like its uptime
     const uint32_t age = (st->info.uptime_s > e->timestamp_s) ? st->info.uptime_s - e->timestamp_s : 0;
     if (age < 3600) {
-        snprintf(time, time_size, "#%lu  %lum ago", number, (unsigned long) (age / 60));
+        snprintf(time, time_size, "%lum ago", (unsigned long) (age / 60));
     } else if (age < 86400) {
-        snprintf(time, time_size, "#%lu  %luh %02lum ago", number, (unsigned long) (age / 3600),
-                 (unsigned long) (age % 3600 / 60));
+        snprintf(time, time_size, "%luh %02lum ago", (unsigned long) (age / 3600), (unsigned long) (age % 3600 / 60));
     } else {
-        snprintf(time, time_size, "#%lu  %lud %luh ago", number, (unsigned long) (age / 86400),
-                 (unsigned long) (age % 86400 / 3600));
+        snprintf(time, time_size, "%lud %luh ago", (unsigned long) (age / 86400), (unsigned long) (age % 86400 / 3600));
     }
     jkbms_log_label(e->code, label, label_size);
 }
@@ -644,14 +689,14 @@ static bool has_error(const jkbms_status_t *st) {
 }
 
 
-static void update_header(const jkbms_status_t *st, bool stale) {
-    // green: fresh data (short reconnects every ~30 s keep it fresh),
-    // red: data went stale, orange: never got data yet
+static void update_header(const jkbms_status_t *st) {
+    // green: data was read (the BMS is read once per wakeup), red: connection
+    // error, orange: no data yet
     uint32_t color = COLOR_WARN;
-    if (st->cells_valid && !stale) {
-        color = COLOR_OK;
-    } else if (st->cells_valid) {
+    if (st->error != JKBMS_ERROR_NONE) {
         color = COLOR_ERROR;
+    } else if (st->cells_valid) {
+        color = COLOR_OK;
     }
     set_text(m_ui.header_title, "BMS %d", m_ui.bms + 1);
     lv_obj_align(m_ui.header_title, LV_ALIGN_LEFT_MID, 6, 0);
@@ -678,19 +723,18 @@ static uint32_t cell_color(const jkbms_cell_info_t *ci, int cell) {
 }
 
 
-static void update_chart(const jkbms_cell_info_t *ci, int selected) {
+static void update_chart(const jkbms_status_t *st, int selected) {
+    const jkbms_cell_info_t *ci = &st->cells;
     const int n = ci->cell_count;
     set_visible(m_ui.chart, true);
-    // stretch the min..max range so that small imbalances stay visible
-    float lo = ci->min_cell_voltage;
-    float hi = ci->max_cell_voltage;
-    const float span_min = 0.020f;
-    if (hi - lo < span_min) {
-        const float mid = (hi + lo) / 2;
-        lo = mid - span_min / 2;
-        hi = mid + span_min / 2;
+    // fixed scale from the cell undervoltage to the overvoltage protection, so
+    // that the bars do not jump with every few mV of change
+    float lo = CHART_DEFAULT_LO;
+    float hi = CHART_DEFAULT_HI;
+    if (st->settings_valid && st->settings.cell_ovp > st->settings.cell_uvp) {
+        lo = st->settings.cell_uvp;
+        hi = st->settings.cell_ovp;
     }
-    lo -= (hi - lo) * 0.25f;
 
     const int gap = (n <= 16) ? 2 : 1;
     const int bar_w = (CHART_W - gap * (n - 1)) / n;
@@ -732,8 +776,9 @@ static void update_summary(const jkbms_status_t *st) {
         color = COLOR_WARN;
     }
     set_color(p->current, color);
-    // keep "A W" on one line of the 135 px wide screen
-    set_text(p->current, fabsf(ci->current) < 10 ? "%+.2fA %+.0fW" : "%+.1fA %+.0fW", ci->current, ci->power);
+    set_color(p->power, color);
+    set_text(p->current, "%+.2f A", ci->current);
+    set_text(p->power, "%+.0f W", ci->power);
 
     lv_bar_set_value(p->soc_bar, ci->soc, LV_ANIM_OFF);
     uint32_t soc_color = ci->soc > 30 ? COLOR_OK : (ci->soc > 10 ? COLOR_WARN : COLOR_ERROR);
@@ -824,7 +869,7 @@ static void update_cell(const jkbms_status_t *st, int i) {
     lv_obj_align_to(p->resistance_unit, p->resistance, LV_ALIGN_OUT_RIGHT_BOTTOM, 4, -5);
     lv_obj_align_to(p->ohm, p->resistance_unit, LV_ALIGN_OUT_RIGHT_BOTTOM, 1, -7);
 
-    update_chart(ci, i);
+    update_chart(st, i);
 }
 
 
@@ -895,28 +940,68 @@ static void update_log(const jkbms_status_t *st, int log_page) {
 }
 
 
+/**
+ * Shows the spinner alone in the middle of the blank screen (no header), or
+ * moved up with a message below it. Errors are red, other messages neutral.
+ */
+static void show_waiting(lv_obj_t *spinner, lv_obj_t *message_label, lv_obj_t *hint_label, const char *message,
+                         const char *hint, bool error) {
+    set_visible(m_ui.header, false);
+    set_visible(spinner, true);
+    // the page containers start below the header, which is hidden now
+    const int center_y = (LCD_V_RES - SPINNER_SIZE) / 2 - HEADER_H;
+    lv_obj_align(spinner, LV_ALIGN_TOP_MID, 0, message[0] ? 0 : center_y);
+    lv_label_set_text(message_label, message);
+    lv_label_set_text(hint_label, hint);
+    set_color(message_label, error ? COLOR_ERROR : COLOR_TEXT);
+}
+
+
+#define HINT_PICK_ANOTHER   "Hold " LV_SYMBOL_LEFT " to pick another BMS."
+
 static void update_nodata(const jkbms_status_t *st) {
     nodata_page_t *p = &m_ui.nodata;
-    set_text(p->title, "BMS %d", m_ui.bms + 1);
-    set_text(p->state, "%s...", jkbms_link_name(st->link));
-    if (st->mac_known) {
-        set_text(p->mac, "%02X:%02X:%02X:%02X:%02X:%02X", st->mac[0], st->mac[1], st->mac[2], st->mac[3],
-                 st->mac[4], st->mac[5]);
-    } else {
-        lv_label_set_text(p->mac, "");
+    const char *message = "";
+    const char *hint = "";
+    bool error = true;
+    switch (st->error) {
+    case JKBMS_ERROR_NONE:
+        break;
+    case JKBMS_ERROR_NOT_FOUND:
+        // the saved BMS is off or away: not an error
+        message = "BMS not found";
+        hint = "Is it on? Close the JK app on the phone. " HINT_PICK_ANOTHER;
+        error = false;
+        break;
+    case JKBMS_ERROR_CONNECT:
+        message = "Connection failed";
+        hint = "Retrying. " HINT_PICK_ANOTHER;
+        break;
+    case JKBMS_ERROR_NOT_JK:
+        message = "Not a JK BMS";
+        hint = HINT_PICK_ANOTHER;
+        break;
+    case JKBMS_ERROR_NO_DATA:
+        message = "BMS not responding";
+        hint = "Retrying. " HINT_PICK_ANOTHER;
+        break;
     }
+    show_waiting(p->spinner, p->message, p->hint, message, hint, error);
 }
 
 
 static void ui_render(void) {
     const jkbms_status_t *st = &m_status[m_ui.bms];
-    const bool stale = (esp_timer_get_time() - st->cells_updated_us) > STALE_US;
     if (m_ui.page >= page_count(m_ui.bms)) {
         m_ui.page = 0;
     }
 
     hide_pages();
-    update_header(st, stale);
+    set_visible(m_ui.header, true);
+    update_header(st);
+    if (has_data(m_ui.bms) && m_ui.data_shown_us == 0) {
+        m_ui.data_shown_us = esp_timer_get_time();
+    }
     int index;
     switch (page_kind(m_ui.bms, m_ui.page, &index)) {
     case PAGE_SUMMARY:
@@ -1008,19 +1093,36 @@ static void monitor_navigate(int step) {
 static void create_picker_page(lv_obj_t *scr) {
     picker_page_t *p = &m_ui.picker;
     p->cont = make_container(scr, HEADER_H, LCD_V_RES - HEADER_H);
-    p->status = make_label(p->cont, &lv_font_montserrat_14, COLOR_DIM, 4, 2);
+    create_waiting(p->cont, &p->spinner, &p->message, &p->message_hint);
+
+    // rows grow with the wrapped text; the list scrolls to the selected row
+    p->list = make_container(p->cont, 0, CONTENT_H - PICKER_HINT_H);
+    lv_obj_add_flag(p->list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(p->list, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_flex_flow(p->list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(p->list, 4, 0);
     for (int i = 0; i < PICKER_ROWS; i++) {
-        lv_obj_t *row = make_container(p->cont, 22 + i * PICKER_ROW_H, PICKER_ROW_H - 2);
+        lv_obj_t *row = lv_obj_create(p->list);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(row, 4, 0);
         lv_obj_set_style_bg_color(row, lv_color_hex(COLOR_HEADER), 0);
+        lv_obj_set_style_border_color(row, lv_color_hex(COLOR_SELECTED), 0);
         lv_obj_set_style_radius(row, 4, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         p->rows[i] = row;
-        p->names[i] = make_label(row, &lv_font_montserrat_14, COLOR_TEXT, 4, 1);
-        lv_obj_set_width(p->names[i], LCD_H_RES - 8);
+        // name and MAC on one line each: the full MAC fits the screen in the 14 px font
+        p->names[i] = make_label(row, &lv_font_montserrat_16, COLOR_TEXT, 0, 0);
+        p->macs[i] = make_label(row, &lv_font_montserrat_14, COLOR_DIM, 0, 0);
+        p->rssis[i] = make_label(row, &lv_font_montserrat_16, COLOR_DIM, 0, 0);
+        lv_obj_set_width(p->names[i], LV_PCT(100));
         lv_label_set_long_mode(p->names[i], LV_LABEL_LONG_DOT);
-        p->details[i] = make_label(row, &lv_font_montserrat_12, COLOR_DIM, 4, 18);
     }
-    p->hint = make_label(p->cont, &lv_font_montserrat_12, COLOR_DIM, 4, LCD_V_RES - HEADER_H - 18);
-    lv_label_set_text(p->hint, LV_SYMBOL_LEFT " next   select " LV_SYMBOL_RIGHT);
+
+    p->hint = make_label(p->cont, &lv_font_montserrat_14, COLOR_DIM, 0, 0);
+    lv_label_set_text(p->hint, LV_SYMBOL_LEFT " next     select " LV_SYMBOL_RIGHT);
+    lv_obj_align(p->hint, LV_ALIGN_BOTTOM_MID, 0, -2);
 }
 
 
@@ -1103,7 +1205,7 @@ static void picker_button(int step) {
     if (m_ui.cursor >= items) {
         m_ui.cursor = 0;
     }
-    if (step < 0) {
+    if (step == BUTTON_PREV) {
         m_ui.cursor = (m_ui.cursor + 1) % items;
     } else if (m_ui.cursor < m_ui.found_count) {
         picker_select(&m_ui.found[m_ui.cursor]);
@@ -1113,11 +1215,21 @@ static void picker_button(int step) {
 }
 
 
+/**
+ * True while the first scan window runs; the found devices are collected
+ * before deciding between auto-select and the list.
+ */
+static bool picker_scanning(void) {
+    const int64_t elapsed = esp_timer_get_time() - m_ui.picker_start_us;
+    return !m_ui.picker_touched && elapsed < CONFIG_UI_AUTO_SELECT_S * 1000000LL;
+}
+
+
 static void picker_tick(void) {
     picker_fetch();
-    const int64_t elapsed = esp_timer_get_time() - m_ui.picker_start_us;
-    if (!m_ui.picker_touched && assigned_count() == 0 && m_ui.found_count == 1
-            && elapsed > CONFIG_UI_AUTO_SELECT_S * 1000000LL) {
+    // the only BMS around is selected without asking, unless the user asked for the list
+    if (!picker_scanning() && !m_ui.picker_touched && !m_ui.picker_manual && assigned_count() == 0
+            && m_ui.found_count == 1) {
         picker_select(&m_ui.found[0]);
     }
 }
@@ -1127,44 +1239,68 @@ static void picker_render(void) {
     picker_page_t *p = &m_ui.picker;
     hide_pages();
     set_visible(p->cont, true);
-
-    const int slot = first_free_slot();
-    set_text(m_ui.header_title, "Pick BMS %d", slot + 1);
-    lv_obj_align(m_ui.header_title, LV_ALIGN_LEFT_MID, 6, 0);
     set_visible(m_ui.header_state, false);
 
-    if (m_ui.found_count == 0) {
-        lv_label_set_text(p->status, "Searching for JK BMS...");
-    } else if (!m_ui.picker_touched && assigned_count() == 0 && m_ui.found_count == 1) {
-        const int64_t elapsed = esp_timer_get_time() - m_ui.picker_start_us;
-        const int left = CONFIG_UI_AUTO_SELECT_S - (int) (elapsed / 1000000LL);
-        set_text(p->status, "Auto-select in %d s", left > 0 ? left : 0);
+    const int items = picker_items();
+    const bool show_list = !picker_scanning() && items > 0;
+    if (show_list) {
+        lv_label_set_text(m_ui.header_title, "Pick BMS");
     } else {
-        set_text(p->status, "Found %d BMS", m_ui.found_count);
+        lv_label_set_text(m_ui.header_title, "JK BMS");
+    }
+    lv_obj_align(m_ui.header_title, LV_ALIGN_LEFT_MID, 6, 0);
+
+    set_visible(m_ui.header, true);
+    set_visible(p->list, show_list);
+    set_visible(p->hint, show_list);
+    if (show_list) {
+        set_visible(p->spinner, false);
+        lv_label_set_text(p->message, "");
+        lv_label_set_text(p->message_hint, "");
+    } else if (picker_scanning()) {
+        show_waiting(p->spinner, p->message, p->message_hint, "", "", false);
+    } else {
+        show_waiting(p->spinner, p->message, p->message_hint, "No JK BMS found",
+                     "Turn the BMS on and close the JK app on the phone.", false);
     }
 
-    const int items = picker_items();
     if (m_ui.cursor >= items) {
         m_ui.cursor = 0;
     }
     for (int i = 0; i < PICKER_ROWS; i++) {
-        const bool visible = i < items;
+        const bool visible = show_list && i < items;
         set_visible(p->rows[i], visible);
         if (!visible) {
             continue;
         }
         lv_obj_set_style_bg_opa(p->rows[i], i == m_ui.cursor ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(p->rows[i], i == m_ui.cursor ? 1 : 0, 0);
-        lv_obj_set_style_border_color(p->rows[i], lv_color_hex(COLOR_SELECTED), 0);
+        lv_obj_set_style_border_width(p->rows[i], i == m_ui.cursor ? 2 : 0, 0);
         if (i < m_ui.found_count) {
             const jkbms_found_t *f = &m_ui.found[i];
             set_text(p->names[i], "%s", f->name[0] ? f->name : "(no name)");
-            set_text(p->details[i], "%02X:%02X:%02X:%02X:%02X:%02X %d", f->mac[0], f->mac[1], f->mac[2], f->mac[3],
-                     f->mac[4], f->mac[5], f->rssi);
+            set_text(p->macs[i], "%02X:%02X:%02X:%02X:%02X:%02X", f->mac[0], f->mac[1], f->mac[2], f->mac[3],
+                     f->mac[4], f->mac[5]);
+#if CONFIG_UI_SCREENSHOT_CONSOLE
+            if (m_ui.anonymize) {
+                static const char *names[] = { "JK-B1A8S20P", "JK-B2A24S15P" };
+                static const uint8_t macs[][6] = { { 0xA4, 0xC1, 0x38, 0x5E, 0x92, 0x07 },
+                                                   { 0x3C, 0x71, 0xBF, 0x0D, 0x4A, 0xE6 } };
+                const uint8_t *mac = macs[i % 2];
+                lv_label_set_text(p->names[i], names[i % 2]);
+                set_text(p->macs[i], "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            }
+#endif
+            set_text(p->rssis[i], "%d dBm", f->rssi);
+            set_visible(p->rssis[i], true);
         } else {
             lv_label_set_text(p->names[i], LV_SYMBOL_OK " Done");
-            set_text(p->details[i], "monitor %d BMS", assigned_count());
+            set_text(p->macs[i], "monitor %d BMS", assigned_count());
+            set_visible(p->rssis[i], false);
         }
+    }
+    if (show_list && m_ui.cursor < items) {
+        lv_obj_update_layout(p->list);
+        lv_obj_scroll_to_view(p->rows[m_ui.cursor], LV_ANIM_OFF);
     }
 }
 
@@ -1174,12 +1310,35 @@ static void picker_render(void) {
 ---------------------------------------------------------------*/
 
 void ui_on_button(int step) {
-    if (step == 0) {
-        // both buttons held: forget the saved BMS and pick again
-        jkbms_ble_forget_saved();
-        esp_restart();
-    }
     lvgl_port_lock(0);
+    m_ui.last_button_us = esp_timer_get_time();
+    if (m_ui.sleep_screen != NULL && !lv_obj_has_flag(m_ui.sleep_screen, LV_OBJ_FLAG_HIDDEN)) {
+        // the press only cancels going to sleep
+        set_visible(m_ui.sleep_screen, false);
+        lvgl_port_unlock();
+        return;
+    }
+    if (step == BUTTON_PREV_LONG) {
+        // forget the saved BMS and show the list of BMS around
+        jkbms_ble_forget_saved();
+        jkbms_ble_unassign_all();
+        m_ui.mode = UI_MODE_PICKER;
+        m_ui.picker_manual = true;
+        m_ui.picker_touched = false;
+        m_ui.picker_start_us = esp_timer_get_time();
+        m_ui.cursor = 0;
+        m_ui.data_shown_us = 0;
+        jkbms_ble_set_discovery(true);
+        ui_fetch_status();
+        picker_fetch();
+        if (m_ui.found_count > 0) {
+            // searched within the last minute: show the list without searching again
+            m_ui.picker_start_us -= CONFIG_UI_AUTO_SELECT_S * 1000000LL;
+        }
+        picker_render();
+        lvgl_port_unlock();
+        return;
+    }
     ui_fetch_status();
     if (m_ui.mode == UI_MODE_PICKER) {
         picker_button(step);
@@ -1192,6 +1351,131 @@ void ui_on_button(int step) {
         ui_render();
     }
     lvgl_port_unlock();
+}
+
+
+/**
+ * Full-screen crescent moon with "z Z Z" on black, drawn with LVGL objects.
+ */
+static void create_sleep_screen(void) {
+    lv_obj_t *scr = lv_layer_top();
+    lv_obj_t *cont = lv_obj_create(scr);
+    lv_obj_remove_style_all(cont);
+    lv_obj_set_size(cont, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_style_bg_color(cont, lv_color_hex(COLOR_BG), 0);
+    lv_obj_set_style_bg_opa(cont, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    // a crescent: a yellow disc partly covered by a black one
+    const struct { int x, y, d; uint32_t color; } discs[] = {
+        { 12, 104, 84, COLOR_MOON },
+        { 40, 88, 76, COLOR_BG },
+    };
+    for (int i = 0; i < 2; i++) {
+        lv_obj_t *disc = lv_obj_create(cont);
+        lv_obj_remove_style_all(disc);
+        lv_obj_set_pos(disc, discs[i].x, discs[i].y);
+        lv_obj_set_size(disc, discs[i].d, discs[i].d);
+        lv_obj_set_style_radius(disc, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(disc, lv_color_hex(discs[i].color), 0);
+        lv_obj_set_style_bg_opa(disc, LV_OPA_COVER, 0);
+    }
+
+    const struct { const char *text; const lv_font_t *font; int x, y; } zs[] = {
+        { "z", &lv_font_montserrat_20, 78, 92 },
+        { "Z", &lv_font_montserrat_28, 92, 56 },
+        { "Z", &lv_font_montserrat_40, 100, 10 },
+    };
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *z = make_label(cont, zs[i].font, COLOR_SLEEP_Z, zs[i].x, zs[i].y);
+        lv_label_set_text(z, zs[i].text);
+    }
+    set_visible(cont, false);
+    m_ui.sleep_screen = cont;
+}
+
+
+bool ui_show_sleep_screen(void) {
+    lvgl_port_lock(0);
+    if (m_ui.sleep_screen == NULL) {
+        create_sleep_screen();
+    }
+    set_visible(m_ui.sleep_screen, true);
+    lvgl_port_unlock();
+    const int64_t shown = esp_timer_get_time();
+    while (esp_timer_get_time() - shown < SLEEP_SCREEN_US) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        lvgl_port_lock(0);
+        const bool visible = !lv_obj_has_flag(m_ui.sleep_screen, LV_OBJ_FLAG_HIDDEN);
+        lvgl_port_unlock();
+        if (!visible) {
+            return false;
+        }
+    }
+    return true;
+}
+
+
+#if CONFIG_UI_SCREENSHOT_CONSOLE
+void ui_debug_anonymize(bool enable) {
+    lvgl_port_lock(0);
+    m_ui.anonymize = enable;
+    lvgl_port_unlock();
+}
+
+
+void ui_debug_sleep_screen(bool show) {
+    lvgl_port_lock(0);
+    m_ui.last_button_us = esp_timer_get_time();
+    if (m_ui.sleep_screen == NULL) {
+        create_sleep_screen();
+    }
+    set_visible(m_ui.sleep_screen, show);
+    lvgl_port_unlock();
+}
+
+
+/**
+ * Prints the screen as "SHOT <w> <h>", one hex RGB565 row per line, "END".
+ */
+void ui_screenshot(void) {
+    lvgl_port_lock(0);
+    m_ui.last_button_us = esp_timer_get_time();
+    const bool sleeping = m_ui.sleep_screen != NULL && !lv_obj_has_flag(m_ui.sleep_screen, LV_OBJ_FLAG_HIDDEN);
+    lv_draw_buf_t *snap = lv_snapshot_take(sleeping ? m_ui.sleep_screen : lv_screen_active(),
+                                           LV_COLOR_FORMAT_RGB565);
+    lvgl_port_unlock();
+    if (snap == NULL) {
+        printf("SHOT ERROR\n");
+        return;
+    }
+    const int w = snap->header.w;
+    const int h = snap->header.h;
+    printf("SHOT %d %d\n", w, h);
+    for (int y = 0; y < h; y++) {
+        const uint8_t *row = snap->data + y * snap->header.stride;
+        for (int x = 0; x < w * 2; x++) {
+            printf("%02x", row[x]);
+        }
+        printf("\n");
+    }
+    printf("END\n");
+    lv_draw_buf_destroy(snap);
+}
+#endif
+
+
+bool ui_should_sleep(void) {
+    if (CONFIG_UI_SLEEP_IDLE_S == 0 || m_ui.mode == UI_MODE_PICKER) {
+        return false;
+    }
+    const int64_t now = esp_timer_get_time();
+    if (m_ui.data_shown_us == 0) {
+        // give up waiting for the BMS; a button press tries again
+        return now > NO_DATA_SLEEP_US && now - m_ui.last_button_us > NO_DATA_SLEEP_US;
+    }
+    const int64_t since = (m_ui.last_button_us > m_ui.data_shown_us) ? m_ui.last_button_us : m_ui.data_shown_us;
+    return now - since > CONFIG_UI_SLEEP_IDLE_S * 1000000LL;
 }
 
 

@@ -2,9 +2,11 @@
  * jkbms_ble.c
  *
  * Bluedroid GATT client for JK BMS (service 0xFFE0, characteristic 0xFFE1).
- * Connection flow follows esphome-jk-bms (jk_bms_ble.cpp):
- *   connect -> enable notifications -> request device info (0x97)
- *   -> request cell info (0x96) -> the BMS streams cell info frames.
+ * Connection flow: connect -> enable notifications -> a BMS that streamed a
+ * moment ago continues by itself; otherwise device info (0x97) followed by
+ * cell info (0x96) starts the stream (0x96 alone does not). The BMS beeps on
+ * every command, so the settings and the logbook are requested only when
+ * asked for, at most once per connection.
  */
 
 #include "jkbms_ble.h"
@@ -15,6 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_bt.h"
@@ -34,11 +37,14 @@
 
 #define SCAN_DURATION_S             10
 #define CONNECT_TIMEOUT_US          (40 * 1000000LL)
-#define INFO_REQUEST_PERIOD_US      (2 * 1000000LL)
-#define INFO_REQUEST_ATTEMPTS       3
-#define CELL_REQUEST_PERIOD_US      (3 * 1000000LL)
+#define PASSIVE_WAIT_US             (2 * 1000000LL)     // the BMS often streams without a request
+#define INFO_REQUEST_ATTEMPTS       2
+#define REQUEST_PERIOD_US           (3 * 1000000LL)
+#define SETTINGS_WAIT_US            (3 * 1000000LL)     // settings often come by themselves
 #define STREAM_STALL_US             (3 * 1000000LL)
 #define LINK_DEAD_US                (60 * 1000000LL)
+#define NOT_FOUND_US                (15 * 1000000LL)
+#define NO_DATA_US                  (20 * 1000000LL)
 #define FOUND_MAX                   8
 #define NVS_NAMESPACE               "jkbms"
 
@@ -52,7 +58,11 @@ typedef struct {
     uint16_t write_handle;
     uint16_t notify_handle;
     bool notify_ready;
+    int64_t notify_ready_us;
     uint8_t info_requests;
+    bool info_this_link;               // device info received on this connection
+    bool settings_requested;           // on this connection
+    bool logbook_requested;            // on this connection
     bool logbook_wanted;
     int64_t link_since_us;
     int64_t last_request_us;
@@ -67,6 +77,18 @@ static bool m_scan_params_set = false;
 static bool m_scanning = false;
 static int m_connecting_idx = -1;
 static bool m_discovery = false;
+static bool m_fetch_extras = true;
+static bool m_reconnect_on_stall = true;
+
+// device info survives deep sleep, so that it is requested once per power-on
+typedef struct {
+    bool valid;
+    uint8_t mac[6];
+    jkbms_proto_t proto;
+    jkbms_device_info_t info;
+} info_cache_t;
+
+static RTC_DATA_ATTR info_cache_t m_info_cache[JKBMS_DEVICES_MAX];
 static jkbms_found_t m_found[FOUND_MAX];
 static const char *TAG = "jkbms";
 
@@ -124,6 +146,9 @@ static bool parse_mac(const char *str, uint8_t mac[6]) {
 }
 
 
+static void slot_reset_link(jkbms_slot_t *slot);
+
+
 /*---------------------------------------------------------------
         Persistent BMS selection
 ---------------------------------------------------------------*/
@@ -168,11 +193,32 @@ static void nvs_save_mac(int idx, const uint8_t mac[6]) {
 void jkbms_ble_forget_saved(void) {
     nvs_handle_t handle;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_erase_all(handle);
+        // the namespace holds other settings too: erase the MACs only
+        for (int i = 0; i < JKBMS_DEVICES_MAX; i++) {
+            char key[8];
+            nvs_mac_key(i, key);
+            nvs_erase_key(handle, key);
+        }
         nvs_commit(handle);
         nvs_close(handle);
     }
     ESP_LOGI(TAG, "saved BMS selection erased");
+}
+
+
+void jkbms_ble_unassign_all(void) {
+    xSemaphoreTakeRecursive(m_lock, portMAX_DELAY);
+    for (int i = 0; i < JKBMS_DEVICES_MAX; i++) {
+        jkbms_slot_t *slot = &m_slots[i];
+        if (slot->st.link >= JKBMS_LINK_CONNECTING) {
+            esp_ble_gap_disconnect(slot->st.mac);
+        }
+        slot_reset_link(slot);
+        memset(&slot->st, 0, sizeof(slot->st));
+        slot_set_link(slot, JKBMS_LINK_UNASSIGNED);
+    }
+    m_connecting_idx = -1;
+    xSemaphoreGiveRecursive(m_lock);
 }
 
 
@@ -198,6 +244,9 @@ static void slot_reset_link(jkbms_slot_t *slot) {
     slot->write_handle = slot->notify_handle = 0;
     slot->notify_ready = false;
     slot->info_requests = 0;
+    slot->info_this_link = false;
+    slot->settings_requested = false;
+    slot->logbook_requested = false;
     slot->assembler.len = 0;
     slot_set_link(slot, slot->st.mac_known ? JKBMS_LINK_SEARCHING : JKBMS_LINK_UNASSIGNED);
 }
@@ -359,6 +408,7 @@ static void on_search_complete(jkbms_slot_t *slot) {
     const int idx = slot - m_slots;
     if (slot->svc_start == 0) {
         ESP_LOGW(TAG, "[BMS %d] " MACSTR_BDA " has no 0xFFE0 service, not a JK BMS", idx + 1, MAC2STR_BDA(slot->st.mac));
+        slot->st.error = JKBMS_ERROR_NOT_JK;
         esp_ble_gap_disconnect(slot->st.mac);
         return;
     }
@@ -370,6 +420,7 @@ static void on_search_complete(jkbms_slot_t *slot) {
                                                               slot->svc_end, char_uuid, chars, &count);
     if (status != ESP_GATT_OK || count == 0) {
         ESP_LOGW(TAG, "[BMS %d] characteristic 0xFFE1 not found", idx + 1);
+        slot->st.error = JKBMS_ERROR_NOT_JK;
         esp_ble_gap_disconnect(slot->st.mac);
         return;
     }
@@ -407,8 +458,7 @@ static void on_search_complete(jkbms_slot_t *slot) {
     } else {
         // no CCCD: notifications are always on
         slot->notify_ready = true;
-        slot_send_command(slot, JKBMS_COMMAND_DEVICE_INFO);
-        slot->info_requests = 1;
+        slot->notify_ready_us = esp_timer_get_time();
     }
 }
 
@@ -419,13 +469,16 @@ static void on_frame(jkbms_slot_t *slot, const uint8_t *frame) {
     case JKBMS_FRAME_TYPE_DEVICE_INFO:
         jkbms_decode_device_info(frame, &slot->st.info);
         slot->st.info_valid = true;
+        slot->info_this_link = true;
         slot->st.proto = jkbms_proto_from_device_info(&slot->st.info);
-        ESP_LOGI(TAG, "[BMS %d] %s '%s' hw %s sw %s, power on count %lu, protocol %s", idx + 1,
-                 slot->st.info.model, slot->st.info.name, slot->st.info.hw_version, slot->st.info.sw_version,
-                 (unsigned long) slot->st.info.power_on_count, jkbms_proto_name(slot->st.proto));
+        m_info_cache[idx] = (info_cache_t) { .valid = true, .proto = slot->st.proto, .info = slot->st.info };
+        memcpy(m_info_cache[idx].mac, slot->st.mac, 6);
         if (slot->st.link != JKBMS_LINK_STREAMING) {
             slot_send_command(slot, JKBMS_COMMAND_CELL_INFO);
         }
+        ESP_LOGI(TAG, "[BMS %d] %s '%s' hw %s sw %s, power on count %lu, protocol %s", idx + 1,
+                 slot->st.info.model, slot->st.info.name, slot->st.info.hw_version, slot->st.info.sw_version,
+                 (unsigned long) slot->st.info.power_on_count, jkbms_proto_name(slot->st.proto));
         break;
     case JKBMS_FRAME_TYPE_CELL_INFO:
         if (slot->st.proto == JKBMS_PROTO_UNKNOWN) {
@@ -439,13 +492,7 @@ static void on_frame(jkbms_slot_t *slot, const uint8_t *frame) {
             ESP_LOGI(TAG, "[BMS %d] streaming: %u cells, %.2f V", idx + 1, slot->st.cells.cell_count,
                      slot->st.cells.total_voltage);
             slot_set_link(slot, JKBMS_LINK_STREAMING);
-            if (!slot->st.settings_valid) {
-                // the BMS sends its settings frame when (re)starting the stream
-                slot_send_command(slot, JKBMS_COMMAND_CELL_INFO);
-            }
-            if (slot->logbook_wanted || !slot->st.logbook_valid) {
-                slot_send_command(slot, JKBMS_COMMAND_LOGBOOK);
-            }
+            slot->st.error = JKBMS_ERROR_NONE;
         }
         break;
     case JKBMS_FRAME_TYPE_LOGBOOK:
@@ -502,12 +549,19 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
         }
         if (param->open.status != ESP_GATT_OK) {
             ESP_LOGW(TAG, "[BMS %d] connect failed, status 0x%x", (int) (slot - m_slots) + 1, param->open.status);
+            slot->st.error = JKBMS_ERROR_CONNECT;
             slot_reset_link(slot);
             break;
         }
         ESP_LOGI(TAG, "[BMS %d] connected, conn_id %u", (int) (slot - m_slots) + 1, param->open.conn_id);
         slot->conn_id = param->open.conn_id;
         slot_set_link(slot, JKBMS_LINK_CONNECTED);
+        const int idx = slot - m_slots;
+        if (!slot->st.info_valid && m_info_cache[idx].valid && memcmp(m_info_cache[idx].mac, slot->st.mac, 6) == 0) {
+            slot->st.info = m_info_cache[idx].info;
+            slot->st.proto = m_info_cache[idx].proto;
+            slot->st.info_valid = true;
+        }
         // JK BMS notifications are longer than the default 23-byte MTU allows
         esp_ble_gattc_send_mtu_req(m_gattc_if, slot->conn_id);
         esp_bt_uuid_t svc_uuid = { .len = ESP_UUID_LEN_16, .uuid.uuid16 = JKBMS_SERVICE_UUID };
@@ -550,8 +604,7 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
                      param->write.status);
         }
         slot->notify_ready = true;
-        slot_send_command(slot, JKBMS_COMMAND_DEVICE_INFO);
-        slot->info_requests = 1;
+        slot->notify_ready_us = esp_timer_get_time();
         break;
     case ESP_GATTC_NOTIFY_EVT: {
         slot = slot_by_conn_id(param->notify.conn_id);
@@ -586,6 +639,33 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
         Supervisor: scanning, requests and timeouts
 ---------------------------------------------------------------*/
 
+/**
+ * Requests the device info, settings and logbook once the stream runs, each
+ * at most once per connection and only if missing or asked for.
+ */
+static void slot_request_extras(jkbms_slot_t *slot, int64_t now) {
+    if (now - slot->last_request_us < REQUEST_PERIOD_US) {
+        return;
+    }
+    // the logbook needs the current BMS uptime from the device info
+    const bool need_info = !slot->st.info_valid
+            || (!slot->info_this_link && (slot->logbook_wanted || (m_fetch_extras && !slot->st.logbook_valid)));
+    if (need_info && slot->info_requests < INFO_REQUEST_ATTEMPTS) {
+        slot_send_command(slot, JKBMS_COMMAND_DEVICE_INFO);
+        slot->info_requests++;
+    } else if (m_fetch_extras && !slot->st.settings_valid && !slot->settings_requested
+               && now - slot->link_since_us > SETTINGS_WAIT_US) {
+        // the BMS sends its settings frame when (re)starting the stream
+        slot_send_command(slot, JKBMS_COMMAND_CELL_INFO);
+        slot->settings_requested = true;
+    } else if ((slot->logbook_wanted || (m_fetch_extras && !slot->st.logbook_valid)) && !slot->logbook_requested
+               && slot->info_this_link) {
+        slot_send_command(slot, JKBMS_COMMAND_LOGBOOK);
+        slot->logbook_requested = true;
+    }
+}
+
+
 static void jkbms_supervisor_task(void *args) {
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -601,35 +681,44 @@ static void jkbms_supervisor_task(void *args) {
                 break;
             case JKBMS_LINK_SEARCHING:
                 searching = true;
+                if (in_state > NOT_FOUND_US) {
+                    slot->st.error = JKBMS_ERROR_NOT_FOUND;
+                }
                 break;
             case JKBMS_LINK_CONNECTING:
                 // Bluedroid reports a failed OPEN_EVT after its own timeout; this is a safety net
                 if (in_state > CONNECT_TIMEOUT_US) {
                     ESP_LOGW(TAG, "[BMS %d] connect timeout", i + 1);
+                    slot->st.error = JKBMS_ERROR_CONNECT;
                     esp_ble_gap_disconnect(slot->st.mac);
                     m_connecting_idx = -1;
                     slot_reset_link(slot);
                 }
                 break;
             case JKBMS_LINK_CONNECTED:
+                if (in_state > NO_DATA_US && slot->st.error == JKBMS_ERROR_NONE) {
+                    slot->st.error = JKBMS_ERROR_NO_DATA;
+                }
                 if (in_state > LINK_DEAD_US) {
                     ESP_LOGW(TAG, "[BMS %d] no data, reconnecting", i + 1);
                     esp_ble_gap_disconnect(slot->st.mac);
-                } else if (!slot->notify_ready) {
-                    // waiting for service discovery
-                } else if (!slot->st.info_valid && slot->info_requests < INFO_REQUEST_ATTEMPTS) {
-                    if (since_request > INFO_REQUEST_PERIOD_US) {
-                        slot_send_command(slot, JKBMS_COMMAND_DEVICE_INFO);
-                        slot->info_requests++;
-                    }
-                } else if (since_request > CELL_REQUEST_PERIOD_US) {
+                } else if (!slot->notify_ready || now - slot->notify_ready_us < PASSIVE_WAIT_US) {
+                    // waiting for service discovery, then for the BMS to stream by itself
+                } else if (since_request < REQUEST_PERIOD_US) {
+                    // waiting for a response
+                } else if (!slot->info_this_link && slot->info_requests < INFO_REQUEST_ATTEMPTS) {
+                    // 0x96 starts the stream only after 0x97
+                    slot_send_command(slot, JKBMS_COMMAND_DEVICE_INFO);
+                    slot->info_requests++;
+                } else {
                     slot_send_command(slot, JKBMS_COMMAND_CELL_INFO);
                 }
                 break;
             case JKBMS_LINK_STREAMING:
+                slot_request_extras(slot, now);
                 // The BMS stops streaming about 30 s after connecting and ignores
                 // further requests; a fresh connection restarts the stream.
-                if (now - slot->st.cells_updated_us > STREAM_STALL_US) {
+                if (m_reconnect_on_stall && now - slot->st.cells_updated_us > STREAM_STALL_US) {
                     ESP_LOGI(TAG, "[BMS %d] stream stalled, reconnecting", i + 1);
                     esp_ble_gap_disconnect(slot->st.mac);
                     slot_set_link(slot, JKBMS_LINK_CONNECTED);
@@ -708,6 +797,16 @@ bool jkbms_ble_get_status(int idx, jkbms_status_t *status) {
 }
 
 
+void jkbms_ble_set_reconnect_on_stall(bool enable) {
+    m_reconnect_on_stall = enable;
+}
+
+
+void jkbms_ble_set_fetch_extras(bool enable) {
+    m_fetch_extras = enable;
+}
+
+
 void jkbms_ble_set_discovery(bool enable) {
     xSemaphoreTakeRecursive(m_lock, portMAX_DELAY);
     m_discovery = enable;
@@ -744,9 +843,7 @@ void jkbms_ble_request_logbook(int idx) {
     xSemaphoreTakeRecursive(m_lock, portMAX_DELAY);
     jkbms_slot_t *slot = &m_slots[idx];
     slot->logbook_wanted = true;
-    if (slot->st.link == JKBMS_LINK_STREAMING) {
-        slot_send_command(slot, JKBMS_COMMAND_LOGBOOK);
-    }
+    slot->logbook_requested = false;
     xSemaphoreGiveRecursive(m_lock);
 }
 

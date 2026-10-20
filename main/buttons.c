@@ -4,6 +4,8 @@
 
 #include "buttons.h"
 
+#include <stdbool.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -14,51 +16,43 @@
 
 #define BUTTON_POLL_MS         10
 #define BUTTON_DEBOUNCE_MS     30
-#define BUTTON_REPEAT_DELAY_MS 500
-#define BUTTON_REPEAT_MS       150
-#define BUTTON_BOTH_HOLD_MS    2000
-
-typedef struct {
-    int gpio;
-    int step;
-    int pressed_ms;           // 0 if released
-    int next_repeat_ms;
-} button_t;
-
-static button_t m_buttons[] = {
-    { .gpio = BUTTON_LEFT_GPIO, .step = -1 },
-    { .gpio = BUTTON_RIGHT_GPIO, .step = +1 },
-};
+#define BUTTON_LONG_MS         1500
 
 
 static void buttons_task(void *args) {
     buttons_cb_t callback = (buttons_cb_t) args;
-    int both_ms = 0;
+    int left_ms = 0;
+    int right_ms = 0;
+    // ignore the press that woke the board up until both buttons are released
+    bool armed = false;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
-        const bool both = gpio_get_level(BUTTON_LEFT_GPIO) == 0 && gpio_get_level(BUTTON_RIGHT_GPIO) == 0;
-        both_ms = both ? both_ms + BUTTON_POLL_MS : 0;
-        if (both_ms == BUTTON_BOTH_HOLD_MS) {
-            callback(0);
+        if (!armed) {
+            armed = gpio_get_level(BUTTON_LEFT_GPIO) != 0 && gpio_get_level(BUTTON_RIGHT_GPIO) != 0;
+            continue;
         }
-        for (int i = 0; i < sizeof(m_buttons) / sizeof(m_buttons[0]); i++) {
-            button_t *btn = &m_buttons[i];
-            if (gpio_get_level(btn->gpio) != 0) {
-                btn->pressed_ms = 0;
-                continue;
+
+        // left: short press fires on release, so that it can become a long press
+        if (gpio_get_level(BUTTON_LEFT_GPIO) == 0) {
+            left_ms += BUTTON_POLL_MS;
+            if (left_ms == BUTTON_LONG_MS) {
+                callback(BUTTON_PREV_LONG);
             }
-            btn->pressed_ms += BUTTON_POLL_MS;
-            if (both) {
-                // no auto-repeat while both buttons are held
-                btn->next_repeat_ms = btn->pressed_ms + BUTTON_REPEAT_MS;
+        } else {
+            if (left_ms >= BUTTON_DEBOUNCE_MS && left_ms < BUTTON_LONG_MS) {
+                callback(BUTTON_PREV);
             }
-            if (btn->pressed_ms == BUTTON_DEBOUNCE_MS) {
-                callback(btn->step);
-                btn->next_repeat_ms = BUTTON_REPEAT_DELAY_MS;
-            } else if (btn->pressed_ms > BUTTON_DEBOUNCE_MS && btn->pressed_ms >= btn->next_repeat_ms) {
-                callback(btn->step);
-                btn->next_repeat_ms += BUTTON_REPEAT_MS;
+            left_ms = 0;
+        }
+
+        // right: fires on press
+        if (gpio_get_level(BUTTON_RIGHT_GPIO) == 0) {
+            right_ms += BUTTON_POLL_MS;
+            if (right_ms == BUTTON_DEBOUNCE_MS) {
+                callback(BUTTON_NEXT);
             }
+        } else {
+            right_ms = 0;
         }
     }
 }

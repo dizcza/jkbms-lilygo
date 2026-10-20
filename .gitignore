@@ -15,3 +15,7 @@ secret/
 secrets/
 dependencies.lock
 .settings/
+web/.env
+web/*.sqlite3
+__pycache__/
+web/gunicorn.pid

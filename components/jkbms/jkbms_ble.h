@@ -29,8 +29,18 @@ typedef enum {
 } jkbms_link_t;
 
 
+typedef enum {
+    JKBMS_ERROR_NONE = 0,
+    JKBMS_ERROR_NOT_FOUND,       // not advertising: off, out of range or the phone app is connected
+    JKBMS_ERROR_CONNECT,         // the BLE connection failed
+    JKBMS_ERROR_NOT_JK,          // connected, but the device has no JK BMS service
+    JKBMS_ERROR_NO_DATA,         // connected, but the BMS does not send data
+} jkbms_error_t;
+
+
 typedef struct {
     jkbms_link_t link;
+    jkbms_error_t error;         // why the link is not streaming; cleared once data arrives
     uint8_t mac[6];
     bool mac_known;
     int rssi;
@@ -75,6 +85,19 @@ bool jkbms_ble_get_status(int idx, jkbms_status_t *status);
 void jkbms_ble_set_discovery(bool enable);
 
 /**
+ * Whether to request the settings and the logbook once the data stream
+ * starts (default true). The logbook is still fetched when requested with
+ * jkbms_ble_request_logbook().
+ */
+void jkbms_ble_set_fetch_extras(bool enable);
+
+/**
+ * Whether to reconnect when the BMS stops streaming (default true). The BMS
+ * stops about 30 s after connecting and beeps on every new connection.
+ */
+void jkbms_ble_set_reconnect_on_stall(bool enable);
+
+/**
  * Lists JK BMS advertisers seen within max_age_us, strongest signal first.
  */
 int jkbms_ble_get_found(jkbms_found_t *list, int max, int64_t max_age_us);
@@ -94,6 +117,11 @@ bool jkbms_ble_assign(int idx, const uint8_t mac[6]);
  * Erases the BMS selection saved by jkbms_ble_assign().
  */
 void jkbms_ble_forget_saved(void);
+
+/**
+ * Disconnects all BMS and makes their slots unassigned (and forgets their data).
+ */
+void jkbms_ble_unassign_all(void);
 
 const char* jkbms_link_name(jkbms_link_t link);
 

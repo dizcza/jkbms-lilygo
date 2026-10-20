@@ -11,7 +11,7 @@ menu "JK BMS BLE"
         help
             MAC address of the first BMS, e.g. "C8:47:8C:12:34:56".
             Leave empty to pick it on the screen; the pick is saved to NVS.
-            Hold both buttons for 2 s to forget it and pick again.
+            Hold the left button for 1.5 s to forget it and pick again.
 
     config JKBMS_MAC_2
         string "BMS 2 MAC address"

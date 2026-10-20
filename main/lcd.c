@@ -12,6 +12,8 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_st7789.h"
 #include "esp_lvgl_port.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #define LCD_HOST                SPI2_HOST
 #define LCD_PIXEL_CLOCK_HZ      (40 * 1000 * 1000)
@@ -29,10 +31,27 @@
 #define LCD_DRAW_BUF_LINES      24
 
 static const char *TAG = "lcd";
+static esp_lcd_panel_handle_t m_panel = NULL;
 
 
 void lcd_backlight(bool on) {
     gpio_set_level(LCD_PIN_BL, on);
+}
+
+
+void lcd_sleep(void) {
+    lcd_backlight(false);
+    if (m_panel != NULL) {
+        // no LVGL flush may run on the SPI bus while the panel goes to sleep
+        lvgl_port_lock(0);
+        lvgl_port_stop();
+        lvgl_port_unlock();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        esp_lcd_panel_disp_on_off(m_panel, false);
+        esp_lcd_panel_disp_sleep(m_panel, true);
+    }
+    gpio_hold_en(LCD_PIN_BL);
+    gpio_deep_sleep_hold_en();
 }
 
 
@@ -41,6 +60,7 @@ lv_display_t* lcd_init(void) {
         .pin_bit_mask = 1ULL << LCD_PIN_BL,
         .mode = GPIO_MODE_OUTPUT,
     };
+    gpio_hold_dis(LCD_PIN_BL);  // held low during deep sleep
     ESP_ERROR_CHECK(gpio_config(&bl_config));
     lcd_backlight(false);
 
@@ -78,6 +98,7 @@ lv_display_t* lcd_init(void) {
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
     ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, LCD_GAP_X, LCD_GAP_Y));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+    m_panel = panel_handle;
 
     const lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     ESP_ERROR_CHECK(lvgl_port_init(&lvgl_cfg));

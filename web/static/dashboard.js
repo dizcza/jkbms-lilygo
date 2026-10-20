@@ -1,0 +1,194 @@
+// Loads /api/latest once and renders one card per BMS; reload the page for new data.
+
+const charts = {};
+
+function esc(text) {
+  const div = document.createElement("div");
+  div.textContent = text ?? "";
+  return div.innerHTML;
+}
+
+// "1d 2h 3m 4s ago", leading zero parts omitted
+function ago(seconds) {
+  let s = Math.max(0, Math.round(seconds));
+  const parts = [];
+  for (const [unit, size] of [["d", 86400], ["h", 3600], ["m", 60]]) {
+    if (s >= size || parts.length) parts.push(`${Math.floor(s / size)}${unit}`);
+    s %= size;
+  }
+  parts.push(`${s}s`);
+  return `${parts.join(" ")} ago`;
+}
+
+function agoSpan(ts, now) {
+  return `<span>${ago(now - ts)}</span>`;
+}
+
+function dateTime(ts) {
+  return new Date(ts * 1000).toLocaleString();
+}
+
+function fmt(value, digits, unit) {
+  return value === undefined || value === null ? "–" : `${Number(value).toFixed(digits)}${unit}`;
+}
+
+function onOff(on) {
+  return on ? '<span class="ok">ON</span>' : '<span class="dim">OFF</span>';
+}
+
+function renderCells(bms) {
+  const cells = bms.cells || [];
+  const max = Math.max(...cells);
+  const min = Math.min(...cells);
+  return cells.map((v, i) => {
+    const classes = ["cell"];
+    if (max > min && v === max) classes.push("max");
+    if (max > min && v === min) classes.push("min");
+    if (bms.wire_warning & (1 << i)) classes.push("wire");
+    const r = bms.resistances ? `${Math.round(bms.resistances[i] * 1000)} mΩ` : "";
+    return `<div class="${classes.join(" ")}"><div class="n">Cell ${i + 1}</div>` +
+           `<div class="v">${v.toFixed(3)} V</div><div class="r">${r}</div></div>`;
+  }).join("");
+}
+
+function renderSettings(settings) {
+  if (!settings) return '<p class="dim">Not received yet.</p>';
+  const rows = [
+    ["Charge switch", settings.charge_enabled ? "ON" : "OFF"],
+    ["Discharge switch", settings.discharge_enabled ? "ON" : "OFF"],
+    ["Balancer switch", settings.balancer_enabled ? "ON" : "OFF"],
+    ["Cells", settings.cell_count],
+    ["Capacity", fmt(settings.capacity, 0, " Ah")],
+    ["Cell UVP / recovery", `${fmt(settings.cell_uvp, 3, "")} / ${fmt(settings.cell_uvp_recovery, 3, " V")}`],
+    ["SOC 0% voltage", fmt(settings.cell_soc0, 3, " V")],
+    ["Power off voltage", fmt(settings.power_off, 3, " V")],
+    ["Cell OVP / recovery", `${fmt(settings.cell_ovp, 3, "")} / ${fmt(settings.cell_ovp_recovery, 3, " V")}`],
+    ["SOC 100% voltage", fmt(settings.cell_soc100, 3, " V")],
+    ["Smart sleep", `${settings.smart_sleep_enabled ? "ON" : "OFF"}, ${fmt(settings.smart_sleep, 3, " V")}, ` +
+                    `${settings.smart_sleep_delay_h} h`],
+    ["Balance start / trigger", `${fmt(settings.balance_start, 3, " V")} / ` +
+                                `${fmt(settings.balance_trigger * 1000, 0, " mV")}`],
+    ["Max balance current", fmt(settings.max_balance_current, 1, " A")],
+    ["Max charge / discharge", `${fmt(settings.max_charge_current, 0, "")} / ` +
+                               `${fmt(settings.max_discharge_current, 0, " A")}`],
+    ["Charge OTP / UTP", `${settings.charge_otp} / ${settings.charge_utp} °C`],
+    ["Discharge OTP / UTP", `${settings.discharge_otp} / ${settings.discharge_utp} °C`],
+    ["MOSFET OTP", `${settings.mosfet_otp} °C`],
+    ["Heating", settings.heating_enabled ? "ON" : "OFF"],
+  ];
+  return "<table>" + rows.map(([k, v]) => `<tr><th>${k}</th><td>${esc(String(v))}</td></tr>`).join("") +
+         "</table>";
+}
+
+function renderEvents(events) {
+  if (!events || !events.length) return '<p class="dim">No events received yet.</p>';
+  return "<table><tr><th>#</th><th>Time</th><th>Event</th></tr>" + events.map(e =>
+    `<tr><td>${e.number}</td><td>${dateTime(e.ts)}</td><td>${esc(e.label)}</td></tr>`).join("") + "</table>";
+}
+
+function details(id, title, body) {
+  return `<details id="${id}"><summary>${title}</summary>${body}</details>`;
+}
+
+function renderCard(bms, now) {
+  const fresh = bms.online && !bms.stale;
+  const dotColor = fresh ? "var(--ok)" : "var(--error)";
+  const errors = bms.error_labels || [];
+  // when online, the data is as old as the last upload of the board
+  const status = fresh ? "" :
+    `offline${bms.error ? " (" + esc(bms.error) + ")" : ""} · last data ` +
+    `${bms.updated ? agoSpan(bms.updated, now) : "never"} · `;
+  const id = bms.mac.replace(/:/g, "");
+  const current = bms.current ?? 0;
+  const currentClass = current > 0.05 ? "ok" : current < -0.05 ? "warn" : "";
+  return `
+  <section class="card${errors.length ? " alarm" : ""}">
+    <h2><span class="dot" style="background:${dotColor}"></span>${esc(bms.name || bms.mac)}</h2>
+    <div class="dim">${esc(bms.model || "")} · ${bms.mac} · hardware version ${esc(bms.hw || "?")} ·
+      software version ${esc(bms.sw || "?")}</div>
+    <div class="dim">${status}board seen ${agoSpan(bms.received, now)}</div>
+    ${errors.length ? `<p class="error">Errors: ${errors.map(esc).join(", ")}</p>` : ""}
+    <div class="stats">
+      <div class="stat"><div class="label">Pack</div><div class="value">${fmt(bms.voltage, 2, " V")}</div></div>
+      <div class="stat"><div class="label">Current</div>
+        <div class="value ${currentClass}">${fmt(bms.current, 2, " A")}</div></div>
+      <div class="stat"><div class="label">Power</div><div class="value">${fmt(bms.power, 0, " W")}</div></div>
+      <div class="stat"><div class="label">SOC</div><div class="value">${fmt(bms.soc, 0, " %")}</div>
+        <div class="soc-bar"><div style="width:${bms.soc ?? 0}%"></div></div></div>
+      <div class="stat"><div class="label">Diff</div>
+        <div class="value">${fmt(bms.diff === undefined ? undefined : bms.diff * 1000, 0, " mV")}</div></div>
+      <div class="stat"><div class="label">CHG / DSG / BAL</div>
+        <div class="value">${onOff(bms.charging)} ${onOff(bms.discharging)} ${onOff(bms.balancing)}</div></div>
+      <div class="stat"><div class="label">T1 / T2 / MOS</div>
+        <div class="value">${fmt(bms.t1, 0, "")} / ${fmt(bms.t2, 0, "")} / ${fmt(bms.t_mos, 0, " °C")}</div></div>
+      <div class="stat"><div class="label">Capacity</div>
+        <div class="value">${fmt(bms.capacity_remaining, 1, "")} / ${fmt(bms.capacity_nominal, 0, " Ah")}</div></div>
+      <div class="stat"><div class="label">Cycles</div><div class="value">${fmt(bms.cycles, 0, "")}</div></div>
+    </div>
+    <div class="cells">${renderCells(bms)}</div>
+    <div class="chart-wrap"><canvas id="chart-${id}"></canvas></div>
+    ${details(`settings-${id}`, "Settings", renderSettings(bms.settings))}
+    ${details(`events-${id}`, `Logbook (${(bms.events || []).length} events)`, renderEvents(bms.events))}
+  </section>`;
+}
+
+async function drawChart(bms) {
+  const id = bms.mac.replace(/:/g, "");
+  const resp = await fetch(`/api/history?mac=${encodeURIComponent(bms.mac)}&hours=48`);
+  if (!resp.ok) return;
+  const rows = await resp.json();
+  const canvas = document.getElementById(`chart-${id}`);
+  if (!canvas) return;
+  const labels = rows.map(r => new Date(r.ts * 1000).toLocaleString([], {
+    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}));
+  charts[id] = new Chart(canvas, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [
+        {label: "Max cell, V", data: rows.map(r => r.max_cell), borderColor: "#ff5252", yAxisID: "cell"},
+        {label: "Min cell, V", data: rows.map(r => r.min_cell), borderColor: "#42a5f5", yAxisID: "cell"},
+        {label: "SOC, %", data: rows.map(r => r.soc), borderColor: "#3ddc84", yAxisID: "pct"},
+        {label: "Current, A", data: rows.map(r => r.current), borderColor: "#ffa726", yAxisID: "amp"},
+      ],
+    },
+    options: {
+      animation: false,
+      maintainAspectRatio: false,
+      elements: {point: {radius: 0}, line: {borderWidth: 1.5}},
+      interaction: {mode: "index", intersect: false},
+      plugins: {legend: {labels: {color: "#e6edf3"}}},
+      scales: {
+        x: {ticks: {color: "#8a949e", maxTicksLimit: 8}, grid: {color: "#2a313a"}},
+        cell: {position: "left", ticks: {color: "#8a949e"}, grid: {color: "#2a313a"}},
+        pct: {position: "right", min: 0, max: 100, ticks: {color: "#3ddc84"}, grid: {display: false}},
+        amp: {position: "right", ticks: {color: "#ffa726"}, grid: {display: false}},
+      },
+    },
+  });
+}
+
+async function refresh() {
+  const resp = await fetch("/api/latest");
+  if (resp.status === 401) {
+    location.href = "/login";
+    return;
+  }
+  render(await resp.json());
+}
+
+function render(data) {
+  const list = document.getElementById("bms-list");
+  if (!data.bms.length) {
+    list.innerHTML = '<p class="dim">No data from the board yet.</p>';
+    return;
+  }
+  Object.values(charts).forEach(c => c.destroy());
+  Object.keys(charts).forEach(k => delete charts[k]);
+  list.innerHTML = data.bms.map(b => renderCard(b, data.now)).join("");
+  data.bms.forEach(drawChart);
+  document.getElementById("updated").textContent = `Loaded ${new Date().toLocaleTimeString()}`;
+}
+
+
+refresh();
