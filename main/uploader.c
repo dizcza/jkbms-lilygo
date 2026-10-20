@@ -1,7 +1,7 @@
 /*
  * uploader.c
  *
- * Wi-Fi networks come from build-time secrets: the end user's network first,
+ * Wi-Fi networks come from build-time secrets: the end user's networks first,
  * then the developer's home networks. Like esp32-sdpsensor, the networks are
  * tried one by one and the one that worked is saved to NVS and tried first
  * next time. Wi-Fi stays connected; a background task rejoins after a drop.
@@ -39,6 +39,9 @@ typedef struct {
 static const wifi_network_t m_networks[] = {
 #ifdef ENV_JKBMS_WIFI_SSID
     { ENV_JKBMS_WIFI_SSID, ENV_JKBMS_WIFI_PASS },
+#endif
+#ifdef ENV_JKBMS_WIFI_SSID1
+    { ENV_JKBMS_WIFI_SSID1, ENV_JKBMS_WIFI_PASS1 },
 #endif
 #ifdef ENV_WIFI_STA_SSID2
     { ENV_WIFI_STA_SSID2, ENV_WIFI_STA_PASS2 },
@@ -172,6 +175,11 @@ esp_err_t uploader_start(void (*on_connected)(void)) {
 }
 
 
+bool uploader_connected(void) {
+    return m_events != NULL && (xEventGroupGetBits(m_events) & BIT_CONNECTED);
+}
+
+
 bool uploader_get_network(char *ssid, size_t ssid_size, char *ip, size_t ip_size) {
     const int network = m_network;
     if (m_events == NULL || network < 0 || !(xEventGroupGetBits(m_events) & BIT_CONNECTED)) {
@@ -186,7 +194,7 @@ bool uploader_get_network(char *ssid, size_t ssid_size, char *ip, size_t ip_size
 esp_err_t uploader_send(const char *json) {
 #if !defined(ENV_JKBMS_UPLOAD_URL) || !defined(ENV_JKBMS_API_TOKEN)
     ESP_LOGW(TAG, "No upload URL or API token, upload skipped");
-    return ESP_ERR_INVALID_STATE;
+    return ESP_ERR_NOT_SUPPORTED;
 #else
     if (m_events == NULL || !(xEventGroupGetBits(m_events) & BIT_CONNECTED)) {
         ESP_LOGW(TAG, "Wi-Fi is not connected, upload skipped");

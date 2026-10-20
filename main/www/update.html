@@ -43,7 +43,7 @@ function setStatus(text, cls) {
 async function loadInfo() {
   const resp = await fetch("/info", {cache: "no-store"});
   const info = await resp.json();
-  document.getElementById("version").textContent = `${info.version}, built ${info.built}`;
+  document.getElementById("version").textContent = `${info.version} (${info.elf})`;
   return info;
 }
 
@@ -53,7 +53,7 @@ async function waitForReboot(started) {
     await new Promise(r => setTimeout(r, 2000));
     try {
       const info = await loadInfo();
-      setStatus(`Done. Running firmware ${info.version}, built ${info.built}.`, "ok");
+      setStatus(`Done. Running firmware ${info.version} (${info.elf}).`, "ok");
       return;
     } catch (e) {
       setStatus(`Rebooting… ${Math.round((Date.now() - started) / 1000)} s`);

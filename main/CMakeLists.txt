@@ -13,12 +13,22 @@ if(NOT CMAKE_BUILD_EARLY_EXPANSION)
     set(JKBMS_SECRETS_FILE "${project_dir}/../secrets/jkbms/firmware.env")
     set(secret_vars ENV_JKBMS_UPLOAD_URL ENV_JKBMS_API_TOKEN
                     ENV_JKBMS_WIFI_SSID ENV_JKBMS_WIFI_PASS
+                    ENV_JKBMS_WIFI_SSID1 ENV_JKBMS_WIFI_PASS1
                     ENV_WIFI_STA_SSID2 ENV_WIFI_STA_PASS2)
     if(EXISTS "${JKBMS_SECRETS_FILE}")
         file(STRINGS "${JKBMS_SECRETS_FILE}" secret_lines REGEX "^[A-Z0-9_]+=.+")
         foreach(line ${secret_lines})
             string(REGEX MATCH "^([A-Z0-9_]+)=(.*)$" _ "${line}")
-            set(secret_${CMAKE_MATCH_1} "${CMAKE_MATCH_2}")
+            set(name "${CMAKE_MATCH_1}")
+            set(value "${CMAKE_MATCH_2}")
+            # VALUE, "VALUE" and 'VALUE' are the same; quotes keep spaces (e.g. in an SSID) readable
+            # one MATCHES per if(): a failed second match would clear CMAKE_MATCH_1
+            if(value MATCHES "^\"(.*)\"$")
+                set(value "${CMAKE_MATCH_1}")
+            elseif(value MATCHES "^'(.*)'$")
+                set(value "${CMAKE_MATCH_1}")
+            endif()
+            set(secret_${name} "${value}")
         endforeach()
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${JKBMS_SECRETS_FILE}")
     else()

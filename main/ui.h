@@ -26,6 +26,12 @@ void ui_refresh(void);
 void ui_on_button(int step);
 
 /**
+ * Shows the first-upload result for 10 s over everything: a green check mark
+ * with "Відправлено" when sent, a red cross when not. A button closes it.
+ */
+void ui_show_upload_result(bool ok);
+
+/**
  * Shows the firmware update progress over everything, 0..100 %.
  * A negative value hides it.
  */

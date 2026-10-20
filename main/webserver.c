@@ -42,10 +42,12 @@ static esp_err_t update_page_handler(httpd_req_t *req) {
 static esp_err_t info_handler(httpd_req_t *req) {
     const esp_app_desc_t *app = esp_app_get_description();
     char json[256];
+    // the ELF SHA-256 tells builds apart: the version string and the build date often stay the same
+    char elf[9];
+    esp_app_get_elf_sha256(elf, sizeof(elf));
     snprintf(json, sizeof(json),
-             "{\"project\":\"%s\",\"version\":\"%s\",\"built\":\"%s %s\",\"idf\":\"%s\",\"partition\":\"%s\"}",
-             app->project_name, app->version, app->date, app->time, app->idf_ver,
-             esp_ota_get_running_partition()->label);
+             "{\"project\":\"%s\",\"version\":\"%s\",\"elf\":\"%s\",\"idf\":\"%s\",\"partition\":\"%s\"}",
+             app->project_name, app->version, elf, app->idf_ver, esp_ota_get_running_partition()->label);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, json);
 }

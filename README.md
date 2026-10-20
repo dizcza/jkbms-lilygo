@@ -44,6 +44,9 @@ header is crossed out in red while the board is offline.
   (re)connection, about once a minute. The first upload after power-on carries the settings
   and the whole logbook; later ones carry new logbook events, and the settings every 10th time.
   Without a BMS the board still reports every 2 minutes, so the dashboard shows it offline.
+  When the first full report of the chosen BMS is delivered, a green check mark with
+  "Відправлено" shows for 10 s; if it fails, a red cross shows instead, until a later upload
+  succeeds. A button press closes it.
 - **Firmware update.** Open http://espbms.local/ (mDNS) or http://&lt;board IP&gt;/ from the same
   network, choose `build/jkbms.bin` and press Upload; a progress bar shows on the page and on
   the display. The new firmware goes to the other of two OTA slots. If it does not get back on
@@ -74,6 +77,8 @@ ENV_JKBMS_UPLOAD_URL=http://<server>:<port>/api/status
 ENV_JKBMS_API_TOKEN=<token, same as JKBMS_API_TOKEN of the dashboard>
 ENV_JKBMS_WIFI_SSID=<Wi-Fi where the board runs>
 ENV_JKBMS_WIFI_PASS=<password>
+ENV_JKBMS_WIFI_SSID1=<optional second network, tried next>
+ENV_JKBMS_WIFI_PASS1=<password>
 ```
 
 The dashboard reads `JKBMS_API_TOKEN`, `JKBMS_WEB_USER`, `JKBMS_WEB_PASSWORD` and `SECRET_KEY`

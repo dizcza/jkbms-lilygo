@@ -23,9 +23,15 @@
 esp_err_t uploader_start(void (*on_connected)(void));
 
 /**
- * POSTs `json` to ENV_JKBMS_UPLOAD_URL. Fails right away without Wi-Fi.
+ * POSTs `json` to ENV_JKBMS_UPLOAD_URL. Returns ESP_ERR_INVALID_STATE right
+ * away without Wi-Fi.
  */
 esp_err_t uploader_send(const char *json);
+
+/**
+ * True while connected to a Wi-Fi network with an IP address.
+ */
+bool uploader_connected(void);
 
 /**
  * Copies the joined network name and the IP address. False when offline.

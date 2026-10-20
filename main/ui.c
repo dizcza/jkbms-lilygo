@@ -52,6 +52,11 @@
 
 #define SPINNER_SIZE      100
 
+#define RESULT_SHOW_US    (10 * 1000000LL)  // the first-upload check mark or cross
+#define RESULT_RING_D     104
+#define RESULT_DISC_D     88
+#define RESULT_Y          28                 // top of the ring
+
 // LiFePO4 cell voltage range of the per-cell bar chart before the BMS settings arrive
 #define CHART_DEFAULT_LO  2.5f
 #define CHART_DEFAULT_HI  3.65f
@@ -210,10 +215,19 @@ static struct {
     lv_obj_t *ota_cont;
     lv_obj_t *ota_label;
     lv_obj_t *ota_bar;
+    // first upload result: a green check mark or a red cross in a double circle
+    lv_obj_t *result_cont;
+    lv_obj_t *result_ring;
+    lv_obj_t *result_disc;
+    lv_obj_t *result_check;
+    lv_obj_t *result_cross[2];
+    lv_obj_t *result_text;
+    int64_t result_until_us;
     bool anonymize;          // screenshots: show made-up BMS names and MACs
 } m_ui;
 
 extern const lv_image_dsc_t ohm_glyph;
+extern const lv_image_dsc_t sent_text;
 
 static void create_picker_page(lv_obj_t *scr);
 static void ui_fetch_status(void);
@@ -1446,8 +1460,92 @@ static void picker_render(void) {
         Public API
 ---------------------------------------------------------------*/
 
+/**
+ * Full screen: a filled disc inside a ring with a check mark (sent) or a
+ * cross (failed), and "Відправлено" below the check mark.
+ */
+static void create_result_screen(void) {
+    lv_obj_t *cont = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(cont);
+    lv_obj_set_size(cont, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_style_bg_color(cont, lv_color_hex(COLOR_BG), 0);
+    lv_obj_set_style_bg_opa(cont, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    m_ui.result_ring = lv_obj_create(cont);
+    lv_obj_remove_style_all(m_ui.result_ring);
+    lv_obj_set_size(m_ui.result_ring, RESULT_RING_D, RESULT_RING_D);
+    lv_obj_align(m_ui.result_ring, LV_ALIGN_TOP_MID, 0, RESULT_Y);
+    lv_obj_set_style_radius(m_ui.result_ring, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(m_ui.result_ring, 4, 0);
+
+    m_ui.result_disc = lv_obj_create(cont);
+    lv_obj_remove_style_all(m_ui.result_disc);
+    lv_obj_set_size(m_ui.result_disc, RESULT_DISC_D, RESULT_DISC_D);
+    lv_obj_align(m_ui.result_disc, LV_ALIGN_TOP_MID, 0, RESULT_Y + (RESULT_RING_D - RESULT_DISC_D) / 2);
+    lv_obj_set_style_radius(m_ui.result_disc, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(m_ui.result_disc, LV_OPA_COVER, 0);
+
+    // the marks are drawn in the disc's coordinates, centre at (44, 44)
+    static const lv_point_precise_t check[] = { { 23, 46 }, { 38, 60 }, { 65, 30 } };
+    static const lv_point_precise_t cross[2][2] = { { { 28, 28 }, { 60, 60 } }, { { 60, 28 }, { 28, 60 } } };
+    lv_obj_t *marks[3];
+    marks[0] = m_ui.result_check = lv_line_create(m_ui.result_disc);
+    lv_line_set_points(m_ui.result_check, check, 3);
+    for (int i = 0; i < 2; i++) {
+        marks[1 + i] = m_ui.result_cross[i] = lv_line_create(m_ui.result_disc);
+        lv_line_set_points(m_ui.result_cross[i], cross[i], 2);
+    }
+    for (int i = 0; i < 3; i++) {
+        lv_obj_set_style_line_width(marks[i], 9, 0);
+        lv_obj_set_style_line_color(marks[i], lv_color_hex(COLOR_TEXT), 0);
+        lv_obj_set_style_line_rounded(marks[i], true, 0);
+    }
+
+    m_ui.result_text = lv_image_create(cont);
+    lv_image_set_src(m_ui.result_text, &sent_text);
+    lv_obj_set_style_image_recolor(m_ui.result_text, lv_color_hex(COLOR_TEXT), 0);
+    lv_obj_set_style_image_recolor_opa(m_ui.result_text, LV_OPA_COVER, 0);
+    lv_obj_align(m_ui.result_text, LV_ALIGN_TOP_MID, 0, RESULT_Y + RESULT_RING_D + 18);
+    m_ui.result_cont = cont;
+}
+
+
+void ui_show_upload_result(bool ok) {
+    lvgl_port_lock(0);
+    if (m_ui.result_cont == NULL) {
+        create_result_screen();
+    }
+    const lv_color_t color = lv_color_hex(ok ? COLOR_OK : COLOR_ERROR);
+    // the cross has no text below it: centre it on the screen
+    const int y = ok ? RESULT_Y : (LCD_V_RES - RESULT_RING_D) / 2;
+    lv_obj_align(m_ui.result_ring, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_align(m_ui.result_disc, LV_ALIGN_TOP_MID, 0, y + (RESULT_RING_D - RESULT_DISC_D) / 2);
+    lv_obj_set_style_border_color(m_ui.result_ring, color, 0);
+    lv_obj_set_style_bg_color(m_ui.result_disc, color, 0);
+    set_visible(m_ui.result_check, ok);
+    set_visible(m_ui.result_cross[0], !ok);
+    set_visible(m_ui.result_cross[1], !ok);
+    set_visible(m_ui.result_text, ok);
+    set_visible(m_ui.result_cont, true);
+    m_ui.result_until_us = esp_timer_get_time() + RESULT_SHOW_US;
+    lvgl_port_unlock();
+}
+
+
+static bool result_visible(void) {
+    return m_ui.result_cont != NULL && !lv_obj_has_flag(m_ui.result_cont, LV_OBJ_FLAG_HIDDEN);
+}
+
+
 void ui_on_button(int step) {
     lvgl_port_lock(0);
+    if (result_visible()) {
+        // the press only closes the upload result
+        set_visible(m_ui.result_cont, false);
+        lvgl_port_unlock();
+        return;
+    }
     if (step == BUTTON_PREV_LONG) {
         // forget the saved BMS and show the list of BMS around
         jkbms_ble_forget_saved();
@@ -1543,7 +1641,8 @@ void ui_debug_anonymize(bool enable) {
 void ui_screenshot(void) {
     lvgl_port_lock(0);
     const bool ota = m_ui.ota_cont != NULL && !lv_obj_has_flag(m_ui.ota_cont, LV_OBJ_FLAG_HIDDEN);
-    lv_draw_buf_t *snap = lv_snapshot_take(ota ? m_ui.ota_cont : lv_screen_active(), LV_COLOR_FORMAT_RGB565);
+    lv_obj_t *top = ota ? m_ui.ota_cont : result_visible() ? m_ui.result_cont : lv_screen_active();
+    lv_draw_buf_t *snap = lv_snapshot_take(top, LV_COLOR_FORMAT_RGB565);
     lvgl_port_unlock();
     if (snap == NULL) {
         printf("SHOT ERROR\n");
@@ -1567,6 +1666,9 @@ void ui_screenshot(void) {
 
 void ui_refresh(void) {
     lvgl_port_lock(0);
+    if (result_visible() && esp_timer_get_time() > m_ui.result_until_us) {
+        set_visible(m_ui.result_cont, false);
+    }
     m_ui.blink = !m_ui.blink;
     ui_fetch_status();
     if (m_ui.mode == UI_MODE_PICKER) {

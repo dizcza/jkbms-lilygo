@@ -201,3 +201,9 @@ char* report_build(uint32_t wake, bool with_extras) {
 void report_mark_sent(void) {
     memcpy(m_logbook_sent, m_logbook_pending, sizeof(m_logbook_sent));
 }
+
+
+void report_reset(void) {
+    memset(m_logbook_sent, 0, sizeof(m_logbook_sent));
+    memset(m_logbook_pending, 0, sizeof(m_logbook_pending));
+}

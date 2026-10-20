@@ -25,6 +25,11 @@ char* report_build(uint32_t wake, bool with_extras);
  */
 void report_mark_sent(void);
 
+/**
+ * Forgets which logbook events were delivered: the next report has them all.
+ */
+void report_reset(void);
+
 #ifdef __cplusplus
 }
 #endif
