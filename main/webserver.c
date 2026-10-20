@@ -27,8 +27,12 @@
 #define SCRATCH_SIZE    4096
 #define HEADER_SIZE     (sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t))
 
+extern const char *const build_time;   // generated, see main/build_time.cmake
+
 static const char *TAG = "web";
 static volatile bool m_ota_active;
+static volatile size_t m_ota_received;  // bytes written so far, for /progress
+static volatile size_t m_ota_total;
 
 
 static esp_err_t update_page_handler(httpd_req_t *req) {
@@ -46,8 +50,9 @@ static esp_err_t info_handler(httpd_req_t *req) {
     char elf[9];
     esp_app_get_elf_sha256(elf, sizeof(elf));
     snprintf(json, sizeof(json),
-             "{\"project\":\"%s\",\"version\":\"%s\",\"elf\":\"%s\",\"idf\":\"%s\",\"partition\":\"%s\"}",
-             app->project_name, app->version, elf, app->idf_ver, esp_ota_get_running_partition()->label);
+             "{\"project\":\"%s\",\"version\":\"%s\",\"built\":\"%s\",\"elf\":\"%s\",\"idf\":\"%s\","
+             "\"partition\":\"%s\"}",
+             app->project_name, app->version, build_time, elf, app->idf_ver, esp_ota_get_running_partition()->label);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, json);
 }
@@ -80,17 +85,38 @@ static void restart_task(void *args) {
 }
 
 
-static esp_err_t upload_firmware_handler(httpd_req_t *req) {
-    static char scratch[SCRATCH_SIZE];  // one upload at a time: httpd runs handlers in one task
+/**
+ * The board's side of the upload progress. The browser's own upload progress
+ * is useless on some phones: Chrome on Android reports 100 % as soon as the
+ * file is handed over to the network stack.
+ */
+static esp_err_t progress_handler(httpd_req_t *req) {
+    char json[80];
+    snprintf(json, sizeof(json), "{\"active\":%s,\"received\":%u,\"total\":%u}",
+             m_ota_active ? "true" : "false", (unsigned) m_ota_received, (unsigned) m_ota_total);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, json);
+}
+
+
+/**
+ * Receives the image into the other OTA slot and replies to the request.
+ */
+static void ota_receive(httpd_req_t *req) {
+    static char scratch[SCRATCH_SIZE];  // one upload at a time, see upload_firmware_handler()
     const esp_partition_t *partition = esp_ota_get_next_update_partition(NULL);
     if (partition == NULL) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No OTA partition");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No OTA partition");
+        return;
     }
     if (req->content_len < HEADER_SIZE || req->content_len > partition->size) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Wrong firmware size");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Wrong firmware size");
+        return;
     }
     ESP_LOGI(TAG, "Receiving %u bytes into %s", (unsigned) req->content_len, partition->label);
-    m_ota_active = true;
+    m_ota_received = 0;
+    m_ota_total = req->content_len;
 
     esp_ota_handle_t handle = 0;
     size_t received = 0;
@@ -133,6 +159,7 @@ static esp_err_t upload_firmware_handler(httpd_req_t *req) {
             error = "Flash write failed";
             break;
         }
+        m_ota_received = received;
         const int percent = (int) (100ULL * received / req->content_len);
         if (percent != shown) {
             ui_ota_progress(percent);
@@ -154,17 +181,50 @@ static esp_err_t upload_firmware_handler(httpd_req_t *req) {
     if (handle != 0) {
         esp_ota_abort(handle);
     }
-    m_ota_active = false;
     if (error != NULL) {
         ESP_LOGW(TAG, "Firmware update failed: %s (%s)", error, esp_err_to_name(err));
         ui_ota_progress(-1);
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, error);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, error);
+        return;
     }
 
     ESP_LOGW(TAG, "Firmware updated, restarting");
     httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_sendstr(req, "Firmware updated, restarting");
     xTaskCreate(restart_task, "restart", 2048, NULL, 5, NULL);
+}
+
+
+static void ota_task(void *args) {
+    httpd_req_t *req = args;
+    ota_receive(req);
+    m_ota_active = false;
+    httpd_req_async_handler_complete(req);
+    vTaskDelete(NULL);
+}
+
+
+/**
+ * The upload runs in its own task, so that the server keeps answering
+ * /progress meanwhile.
+ */
+static esp_err_t upload_firmware_handler(httpd_req_t *req) {
+    if (m_ota_active) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Another firmware update is running");
+    }
+    httpd_req_t *async = NULL;
+    esp_err_t err = httpd_req_async_handler_begin(req, &async);
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+    }
+    m_ota_active = true;
+    m_ota_received = 0;
+    m_ota_total = 0;
+    if (xTaskCreate(ota_task, "ota", 6144, async, 5, NULL) != pdPASS) {
+        m_ota_active = false;
+        httpd_resp_send_err(async, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        httpd_req_async_handler_complete(async);
+    }
     return ESP_OK;
 }
 
@@ -189,6 +249,7 @@ esp_err_t webserver_start(void) {
     static const httpd_uri_t uris[] = {
         { .uri = "/", .method = HTTP_GET, .handler = update_page_handler },
         { .uri = "/info", .method = HTTP_GET, .handler = info_handler },
+        { .uri = "/progress", .method = HTTP_GET, .handler = progress_handler },
         { .uri = "/upload_firmware", .method = HTTP_POST, .handler = upload_firmware_handler },
     };
     for (int i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {

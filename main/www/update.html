@@ -43,7 +43,7 @@ function setStatus(text, cls) {
 async function loadInfo() {
   const resp = await fetch("/info", {cache: "no-store"});
   const info = await resp.json();
-  document.getElementById("version").textContent = `${info.version} (${info.elf})`;
+  document.getElementById("version").textContent = `${info.version}, built ${info.built} (${info.elf})`;
   return info;
 }
 
@@ -53,7 +53,7 @@ async function waitForReboot(started) {
     await new Promise(r => setTimeout(r, 2000));
     try {
       const info = await loadInfo();
-      setStatus(`Done. Running firmware ${info.version} (${info.elf}).`, "ok");
+      setStatus(`Done. Running firmware ${info.version}, built ${info.built}.`, "ok");
       return;
     } catch (e) {
       setStatus(`Rebooting… ${Math.round((Date.now() - started) / 1000)} s`);
@@ -76,15 +76,28 @@ function uploadFirmware() {
   progress.hidden = false;
   progress.value = 0;
 
-  const xhttp = new XMLHttpRequest();
-  xhttp.upload.onprogress = (e) => {
-    if (e.lengthComputable) {
-      const percent = Math.round(100 * e.loaded / e.total);
-      progress.value = percent;
-      setStatus(`Uploading ${percent} % (${Math.round(e.loaded / 1024)} of ${Math.round(e.total / 1024)} KB)`);
+  // the bar follows what the board has written: the browser's own upload
+  // progress jumps to 100 % at once on some phones (Chrome on Android)
+  setStatus("Sending…");
+  let finished = false;   // a late /progress answer must not overwrite the result
+  const poll = setInterval(async () => {
+    try {
+      const resp = await fetch("/progress", {cache: "no-store"});
+      const p = await resp.json();
+      if (p.total > 0 && !finished) {
+        const percent = Math.floor(100 * p.received / p.total);
+        progress.value = percent;
+        setStatus(`Writing ${percent} % (${Math.round(p.received / 1024)} of ${Math.round(p.total / 1024)} KB)`);
+      }
+    } catch (e) {
+      // the board is busy or rebooting; try again on the next tick
     }
-  };
+  }, 700);
+
+  const xhttp = new XMLHttpRequest();
   xhttp.onload = () => {
+    finished = true;
+    clearInterval(poll);
     if (xhttp.status == 200) {
       progress.value = 100;
       setStatus("Uploaded. Rebooting…");
@@ -96,6 +109,8 @@ function uploadFirmware() {
     }
   };
   xhttp.onerror = () => {
+    finished = true;
+    clearInterval(poll);
     setStatus("The connection was closed. Try again.", "error");
     input.disabled = false;
     button.disabled = false;

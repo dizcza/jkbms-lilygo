@@ -1,5 +1,11 @@
 file (GLOB SOURCES *.c)
-idf_component_register(SRCS ${SOURCES}
+# the build time, regenerated on every build: the date in the IDF app descriptor
+# only changes when IDF happens to recompile it
+set(build_time_c "${CMAKE_CURRENT_BINARY_DIR}/build_time.c")
+if(NOT CMAKE_BUILD_EARLY_EXPANSION)
+    set_source_files_properties(${build_time_c} PROPERTIES GENERATED TRUE)
+endif()
+idf_component_register(SRCS ${SOURCES} ${build_time_c}
                        INCLUDE_DIRS "."
                        EMBED_TXTFILES "www/update.html"
                        REQUIRES jkbms nvs_flash esp_lcd esp_driver_spi esp_driver_gpio esp_timer
@@ -7,6 +13,11 @@ idf_component_register(SRCS ${SOURCES}
                                 esp_http_server app_update)
 
 if(NOT CMAKE_BUILD_EARLY_EXPANSION)
+    # the second output is never created, so the command runs on every build
+    add_custom_command(OUTPUT ${build_time_c} ${CMAKE_CURRENT_BINARY_DIR}/build_time.always
+                       COMMAND ${CMAKE_COMMAND} -DOUT=${build_time_c} -P ${CMAKE_CURRENT_LIST_DIR}/build_time.cmake
+                       VERBATIM)
+
     # Build-time secrets: KEY=VALUE lines of the secrets file, overridden by
     # environment variables of the same name. Run `idf.py reconfigure` after changing them.
     idf_build_get_property(project_dir PROJECT_DIR)

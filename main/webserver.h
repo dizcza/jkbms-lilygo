@@ -5,6 +5,7 @@
  * from esp32-sdpsensor:
  *   GET  /                 the update page with an upload button and progress bar
  *   GET  /info             running firmware as JSON
+ *   GET  /progress         bytes of the running upload written so far, as JSON
  *   POST /upload_firmware  the raw .bin, written to the other OTA slot
  */
 
