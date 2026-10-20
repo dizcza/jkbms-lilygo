@@ -24,7 +24,9 @@
 #endif
 #include "esp_timer.h"
 #include "buttons.h"
+#include "history.h"
 #include "jkbms_ble.h"
+#include "nvs.h"
 #include "lcd.h"
 
 #define COLOR_BG          0x000000
@@ -49,6 +51,12 @@
 #define NO_DATA_SLEEP_US  (30 * 1000000LL)
 
 #define SPINNER_SIZE      100
+
+#define HISTORY_PAGES     2          // 24 hours, 7 days
+#define HISTORY_POINTS    120
+#define ALERT_SOC         2          // %: alert when the battery got this low
+#define ALERT_BEFORE_S    (3 * 3600) // average current over this time before going low
+#define ALERT_NVS_KEY     "seen_seq" // history records already shown in an alert
 
 #define SLEEP_SCREEN_US   (2 * 1000000LL)
 #define COLOR_MOON        0xFFE082
@@ -79,6 +87,7 @@ typedef enum {
 typedef enum {
     PAGE_SUMMARY,
     PAGE_PACK,
+    PAGE_HISTORY,
     PAGE_CELLS,
     PAGE_CELL,
     PAGE_ERRORS,
@@ -136,6 +145,50 @@ typedef struct {
 typedef struct {
     lv_obj_t *cont;
     lv_obj_t *title;
+    lv_obj_t *chart;
+    lv_chart_series_t *soc;
+    lv_chart_series_t *cell;
+    lv_obj_t *legend_soc;
+    lv_obj_t *legend_cell;
+    lv_obj_t *range;
+    // cached chart data, recomputed when the key changes
+    int32_t soc_points[HISTORY_POINTS];
+    int32_t cell_points[HISTORY_POINTS];
+    uint16_t cell_lo_mv;
+    uint16_t cell_hi_mv;
+    int cache_bms;
+    int cache_page;
+    uint32_t cache_seq;
+} history_page_t;
+
+typedef struct {
+    lv_obj_t *cont;
+    lv_obj_t *title;
+    lv_obj_t *body;
+    lv_obj_t *hint;
+} alert_page_t;
+
+// what happened while nobody was looking, from the flash history
+typedef struct {
+    bool show;
+    int slot;
+    uint32_t newest_time;
+    bool low;
+    uint32_t low_time;          // oldest record below ALERT_SOC
+    uint16_t lowest_mv;
+    uint8_t lowest_cell;
+    uint32_t lowest_time;
+    bool dsg_off;
+    uint32_t dsg_off_time;      // oldest record with the discharge switch off
+    uint32_t errors;
+    uint32_t error_time[32];    // oldest record with each alarm bit
+    bool avg_valid;
+    float avg_current;          // A, over ALERT_BEFORE_S before going low
+} alert_info_t;
+
+typedef struct {
+    lv_obj_t *cont;
+    lv_obj_t *title;
     lv_obj_t *names[SETTINGS_ROWS];
     lv_obj_t *values[SETTINGS_ROWS];
 } settings_page_t;
@@ -182,6 +235,10 @@ static struct {
     cells_page_t cells;
     cell_page_t cell_page;
     errors_page_t errors;
+    history_page_t history;
+    alert_page_t alert;
+    alert_info_t alert_info;
+    bool alert_active;
     settings_page_t settings;
     log_page_t log;
     nodata_page_t nodata;
@@ -212,6 +269,13 @@ static void create_picker_page(lv_obj_t *scr);
 static void ui_fetch_status(void);
 static void enter_monitor(void);
 static int first_free_slot(void);
+static void create_history_page(lv_obj_t *scr);
+static void create_alert_page(lv_obj_t *scr);
+static void update_history(const jkbms_status_t *st, int history_page);
+static void update_alert(void);
+static int assigned_count(void);
+static void alert_compute(void);
+static void alert_mark_seen(void);
 
 static jkbms_status_t m_status[JKBMS_DEVICES_MAX];
 
@@ -422,6 +486,8 @@ static void hide_pages(void) {
     set_visible(m_ui.cells.cont, false);
     set_visible(m_ui.cell_page.cont, false);
     set_visible(m_ui.errors.cont, false);
+    set_visible(m_ui.history.cont, false);
+    set_visible(m_ui.alert.cont, false);
     set_visible(m_ui.settings.cont, false);
     set_visible(m_ui.log.cont, false);
     set_visible(m_ui.nodata.cont, false);
@@ -453,6 +519,8 @@ void ui_init(lv_display_t *disp) {
 
     create_summary_page(scr);
     create_pack_page(scr);
+    create_history_page(scr);
+    create_alert_page(scr);
     create_cells_page(scr);
     create_cell_page(scr);
     create_errors_page(scr);
@@ -472,6 +540,7 @@ void ui_init(lv_display_t *disp) {
     }
     if (any_assigned) {
         enter_monitor();
+        alert_compute();
     } else {
         m_ui.mode = UI_MODE_PICKER;
         jkbms_ble_set_discovery(true);
@@ -570,6 +639,17 @@ static int settings_pages(int bms) {
 }
 
 
+static void format_age(uint32_t age, char *buf, size_t size) {
+    if (age < 3600) {
+        snprintf(buf, size, "%lum ago", (unsigned long) (age / 60));
+    } else if (age < 86400) {
+        snprintf(buf, size, "%luh %02lum ago", (unsigned long) (age / 3600), (unsigned long) (age % 3600 / 60));
+    } else {
+        snprintf(buf, size, "%lud %luh ago", (unsigned long) (age / 86400), (unsigned long) (age % 86400 / 3600));
+    }
+}
+
+
 /**
  * Formats logbook event n (0 = newest): its age and its description.
  */
@@ -577,14 +657,8 @@ static void log_event_text(const jkbms_status_t *st, int n, char *time, size_t t
                            size_t label_size) {
     const jkbms_log_entry_t *e = &st->logbook[st->logbook_count - 1 - n];
     // timestamps count seconds since the BMS was first powered, like its uptime
-    const uint32_t age = (st->info.uptime_s > e->timestamp_s) ? st->info.uptime_s - e->timestamp_s : 0;
-    if (age < 3600) {
-        snprintf(time, time_size, "%lum ago", (unsigned long) (age / 60));
-    } else if (age < 86400) {
-        snprintf(time, time_size, "%luh %02lum ago", (unsigned long) (age / 3600), (unsigned long) (age % 3600 / 60));
-    } else {
-        snprintf(time, time_size, "%lud %luh ago", (unsigned long) (age / 86400), (unsigned long) (age % 86400 / 3600));
-    }
+    const uint32_t now = jkbms_bms_now_s(st);
+    format_age(now > e->timestamp_s ? now - e->timestamp_s : 0, time, time_size);
     jkbms_log_label(e->code, label, label_size);
 }
 
@@ -627,8 +701,8 @@ static int page_count(int bms) {
     if (!has_data(bms)) {
         return 1;
     }
-    // summary + cells + pack + N cell pages + errors + settings pages + logbook pages
-    return 3 + m_status[bms].cells.cell_count + 1 + settings_pages(bms) + log_pages(bms);
+    // summary + cells + pack + history pages + N cell pages + errors + settings pages + logbook pages
+    return 3 + HISTORY_PAGES + m_status[bms].cells.cell_count + 1 + settings_pages(bms) + log_pages(bms);
 }
 
 
@@ -651,19 +725,27 @@ static page_kind_t page_kind(int bms, int page, int *index) {
     if (page == 2) {
         return PAGE_PACK;
     }
-    if (page < 3 + cells) {
-        *index = page - 3;
+    int first = 3;
+    if (page < first + HISTORY_PAGES) {
+        *index = page - first;
+        return PAGE_HISTORY;
+    }
+    first += HISTORY_PAGES;
+    if (page < first + cells) {
+        *index = page - first;
         return PAGE_CELL;
     }
-    if (page == 3 + cells) {
+    first += cells;
+    if (page == first) {
         return PAGE_ERRORS;
     }
+    first++;
     const int settings = settings_pages(bms);
-    if (page < 4 + cells + settings) {
-        *index = page - 4 - cells;
+    if (page < first + settings) {
+        *index = page - first;
         return PAGE_SETTINGS;
     }
-    *index = page - 4 - cells - settings;
+    *index = page - first - settings;
     return PAGE_LOG;
 }
 
@@ -997,6 +1079,12 @@ static void ui_render(void) {
     }
 
     hide_pages();
+    if (m_ui.alert_active) {
+        set_visible(m_ui.header, false);
+        update_alert();
+        set_visible(m_ui.alert.cont, true);
+        return;
+    }
     set_visible(m_ui.header, true);
     update_header(st);
     if (has_data(m_ui.bms) && m_ui.data_shown_us == 0) {
@@ -1007,6 +1095,10 @@ static void ui_render(void) {
     case PAGE_SUMMARY:
         update_summary(st);
         set_visible(m_ui.summary.cont, true);
+        break;
+    case PAGE_HISTORY:
+        update_history(st, index);
+        set_visible(m_ui.history.cont, true);
         break;
     case PAGE_PACK:
         update_pack(st);
@@ -1037,6 +1129,283 @@ static void ui_render(void) {
         set_visible(m_ui.nodata.cont, true);
         break;
     }
+}
+
+
+/*---------------------------------------------------------------
+        History charts and the drain alert
+---------------------------------------------------------------*/
+
+static void create_history_page(lv_obj_t *scr) {
+    history_page_t *p = &m_ui.history;
+    p->cont = make_container(scr, HEADER_H, CONTENT_H);
+    p->title = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 4, 2);
+
+    p->chart = lv_chart_create(p->cont);
+    lv_obj_set_pos(p->chart, 2, 30);
+    lv_obj_set_size(p->chart, LCD_H_RES - 4, 130);
+    lv_chart_set_type(p->chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_point_count(p->chart, HISTORY_POINTS);
+    lv_chart_set_div_line_count(p->chart, 5, 0);
+    lv_chart_set_range(p->chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
+    lv_obj_set_style_bg_opa(p->chart, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(p->chart, 0, 0);
+    lv_obj_set_style_pad_all(p->chart, 0, 0);
+    lv_obj_set_style_pad_hor(p->chart, 4, 0);  // room for the point markers at the edges
+    lv_obj_set_style_line_color(p->chart, lv_color_hex(COLOR_HEADER), LV_PART_MAIN);
+    lv_obj_set_style_line_width(p->chart, 2, LV_PART_ITEMS);
+    // small point markers: a few records do not make a line yet
+    lv_obj_set_style_size(p->chart, 4, 4, LV_PART_INDICATOR);
+    p->soc = lv_chart_add_series(p->chart, lv_color_hex(COLOR_OK), LV_CHART_AXIS_PRIMARY_Y);
+    p->cell = lv_chart_add_series(p->chart, lv_color_hex(COLOR_MIN), LV_CHART_AXIS_SECONDARY_Y);
+
+    p->legend_soc = make_label(p->cont, &lv_font_montserrat_14, COLOR_OK, 4, 166);
+    lv_label_set_text(p->legend_soc, "SOC");
+    p->legend_cell = make_label(p->cont, &lv_font_montserrat_14, COLOR_MIN, 44, 166);
+    lv_label_set_text(p->legend_cell, "lowest cell");
+    p->range = make_label(p->cont, &lv_font_montserrat_14, COLOR_DIM, 4, 186);
+    p->cache_bms = -1;
+}
+
+
+typedef struct {
+    int slot;
+    uint32_t now;
+    uint32_t window;
+    history_page_t *page;
+} history_chart_ctx_t;
+
+
+static bool history_chart_cb(const history_record_t *r, void *arg) {
+    history_chart_ctx_t *ctx = arg;
+    if (r->time_s > ctx->now) {
+        return true;  // recorded with a newer device info: ignore
+    }
+    const uint32_t age = ctx->now - r->time_s;
+    if (age >= ctx->window) {
+        return false;
+    }
+    if (r->slot != ctx->slot) {
+        return true;
+    }
+    history_page_t *p = ctx->page;
+    const int i = HISTORY_POINTS - 1 - (int) ((uint64_t) age * HISTORY_POINTS / ctx->window);
+    // records come newest first: keep the newest SOC and the lowest cell of each point
+    if (p->soc_points[i] == LV_CHART_POINT_NONE) {
+        p->soc_points[i] = r->soc;
+    }
+    if (p->cell_points[i] == LV_CHART_POINT_NONE || r->min_mv < p->cell_points[i]) {
+        p->cell_points[i] = r->min_mv;
+    }
+    if (r->min_mv < p->cell_lo_mv) {
+        p->cell_lo_mv = r->min_mv;
+    }
+    if (r->min_mv > p->cell_hi_mv) {
+        p->cell_hi_mv = r->min_mv;
+    }
+    return true;
+}
+
+
+static void update_history(const jkbms_status_t *st, int history_page) {
+    history_page_t *p = &m_ui.history;
+    const uint32_t window = (history_page == 0) ? 86400 : 7 * 86400;
+    lv_label_set_text(p->title, history_page == 0 ? "Last 24 h" : "Last 7 days");
+
+    const uint32_t seq = history_last_seq();
+    if (p->cache_bms != m_ui.bms || p->cache_page != history_page || p->cache_seq != seq) {
+        p->cache_bms = m_ui.bms;
+        p->cache_page = history_page;
+        p->cache_seq = seq;
+        for (int i = 0; i < HISTORY_POINTS; i++) {
+            p->soc_points[i] = LV_CHART_POINT_NONE;
+            p->cell_points[i] = LV_CHART_POINT_NONE;
+        }
+        p->cell_lo_mv = UINT16_MAX;
+        p->cell_hi_mv = 0;
+        history_chart_ctx_t ctx = { .slot = m_ui.bms, .now = jkbms_bms_now_s(st), .window = window, .page = p };
+        if (ctx.now > 0) {
+            history_foreach(history_chart_cb, &ctx);
+        }
+    }
+
+    // cell voltage scale from the protection limits, like the bar chart
+    int32_t lo = (int32_t) (CHART_DEFAULT_LO * 1000);
+    int32_t hi = (int32_t) (CHART_DEFAULT_HI * 1000);
+    if (st->settings_valid && st->settings.cell_ovp > st->settings.cell_uvp) {
+        lo = (int32_t) (st->settings.cell_uvp * 1000);
+        hi = (int32_t) (st->settings.cell_ovp * 1000);
+    }
+    lv_chart_set_range(p->chart, LV_CHART_AXIS_SECONDARY_Y, lo, hi);
+    for (int i = 0; i < HISTORY_POINTS; i++) {
+        lv_chart_set_value_by_id(p->chart, p->soc, i, p->soc_points[i]);
+        lv_chart_set_value_by_id(p->chart, p->cell, i, p->cell_points[i]);
+    }
+    lv_chart_refresh(p->chart);
+    if (p->cell_hi_mv == 0) {
+        lv_label_set_text(p->range, "No records yet");
+    } else {
+        set_text(p->range, "cell %.2f-%.2f V", p->cell_lo_mv / 1000.0f, p->cell_hi_mv / 1000.0f);
+    }
+}
+
+
+static void create_alert_page(lv_obj_t *scr) {
+    alert_page_t *p = &m_ui.alert;
+    p->cont = make_container(scr, 0, LCD_V_RES);
+    p->title = make_label(p->cont, &lv_font_montserrat_28, COLOR_ERROR, 4, 2);
+    lv_label_set_text(p->title, LV_SYMBOL_WARNING " Alert");
+    p->body = make_label(p->cont, &lv_font_montserrat_14, COLOR_TEXT, 4, 40);
+    lv_obj_set_width(p->body, LCD_H_RES - 8);
+    lv_label_set_long_mode(p->body, LV_LABEL_LONG_WRAP);
+    p->hint = make_label(p->cont, &lv_font_montserrat_14, COLOR_DIM, 4, LCD_V_RES - 20);
+    lv_label_set_text(p->hint, "Press any button");
+}
+
+
+static uint32_t alert_seen_seq(void) {
+    uint32_t seen = 0;
+    nvs_handle_t handle;
+    if (nvs_open("jkbms", NVS_READONLY, &handle) == ESP_OK) {
+        nvs_get_u32(handle, ALERT_NVS_KEY, &seen);
+        nvs_close(handle);
+    }
+    return seen;
+}
+
+
+static void alert_mark_seen(void) {
+    nvs_handle_t handle;
+    if (nvs_open("jkbms", NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_u32(handle, ALERT_NVS_KEY, history_last_seq());
+        nvs_commit(handle);
+        nvs_close(handle);
+    }
+}
+
+
+static bool alert_scan_cb(const history_record_t *r, void *arg) {
+    alert_info_t *a = arg;
+    if (a->newest_time == 0) {
+        a->newest_time = r->time_s;
+    }
+    // records come newest first: overwriting keeps the oldest occurrence
+    if (r->soc < ALERT_SOC) {
+        a->low = true;
+        a->low_time = r->time_s;
+        a->slot = r->slot;
+    }
+    if (a->lowest_mv == 0 || r->min_mv < a->lowest_mv) {
+        a->lowest_mv = r->min_mv;
+        a->lowest_cell = r->min_cell;
+        a->lowest_time = r->time_s;
+    }
+    if (!(r->flags & HISTORY_FLAG_DISCHARGING)) {
+        a->dsg_off = true;
+        a->dsg_off_time = r->time_s;
+    }
+    for (uint8_t bit = 0; bit < 32; bit++) {
+        // "Battery is fully charged" (bit 4) is a status, not an error
+        if ((r->errors & (1UL << bit)) && bit != 4 && jkbms_error_label(bit) != NULL) {
+            a->errors |= 1UL << bit;
+            a->error_time[bit] = r->time_s;
+            a->slot = r->slot;
+        }
+    }
+    return true;
+}
+
+
+typedef struct {
+    alert_info_t *alert;
+    uint32_t seen;
+    int count;
+    float sum;
+} alert_ctx_t;
+
+
+static bool alert_unseen_cb(const history_record_t *r, void *arg) {
+    alert_ctx_t *ctx = arg;
+    if (r->seq <= ctx->seen) {
+        return false;
+    }
+    return alert_scan_cb(r, ctx->alert);
+}
+
+
+static bool alert_average_cb(const history_record_t *r, void *arg) {
+    alert_ctx_t *ctx = arg;
+    const uint32_t low = ctx->alert->low_time;
+    if (r->time_s + ALERT_BEFORE_S < low) {
+        return false;
+    }
+    if (r->time_s < low && r->slot == ctx->alert->slot) {
+        ctx->sum += r->current_ca / 100.0f;
+        ctx->count++;
+    }
+    return true;
+}
+
+
+/**
+ * Looks for a low battery or alarms in the records not alerted yet.
+ */
+static void alert_compute(void) {
+    alert_info_t *a = &m_ui.alert_info;
+    memset(a, 0, sizeof(*a));
+    alert_ctx_t ctx = { .alert = a, .seen = alert_seen_seq() };
+    history_foreach(alert_unseen_cb, &ctx);
+    a->show = a->low || a->errors != 0;
+    if (a->low) {
+        ctx.count = 0;
+        ctx.sum = 0;
+        history_foreach(alert_average_cb, &ctx);
+        a->avg_valid = ctx.count > 0;
+        a->avg_current = ctx.count > 0 ? ctx.sum / ctx.count : 0;
+    }
+    m_ui.alert_active = a->show;
+    if (a->show) {
+        m_ui.bms = a->slot;
+    }
+}
+
+
+static void update_alert(void) {
+    const alert_info_t *a = &m_ui.alert_info;
+    // ages relative to the BMS clock now, or to the newest record before the BMS answers
+    uint32_t now = jkbms_bms_now_s(&m_status[a->slot]);
+    if (now < a->newest_time) {
+        now = a->newest_time;
+    }
+    char text[640];
+    char age[24];
+    size_t pos = 0;
+    if (assigned_count() > 1) {
+        pos += snprintf(text + pos, sizeof(text) - pos, "BMS %d\n", a->slot + 1);
+    }
+    if (a->low) {
+        format_age(now - a->low_time, age, sizeof(age));
+        pos += snprintf(text + pos, sizeof(text) - pos, "Battery below %d%%\n  %s\n", ALERT_SOC, age);
+        if (a->avg_valid) {
+            pos += snprintf(text + pos, sizeof(text) - pos, "Avg 3 h before\n  %+.2f A\n", a->avg_current);
+        }
+    }
+    if (a->lowest_mv > 0) {
+        format_age(now - a->lowest_time, age, sizeof(age));
+        pos += snprintf(text + pos, sizeof(text) - pos, "Lowest cell #%u\n  %.3f V, %s\n", a->lowest_cell,
+                        a->lowest_mv / 1000.0f, age);
+    }
+    if (a->dsg_off) {
+        format_age(now - a->dsg_off_time, age, sizeof(age));
+        pos += snprintf(text + pos, sizeof(text) - pos, "Discharge OFF\n  %s\n", age);
+    }
+    for (uint8_t bit = 0; bit < 32 && pos < sizeof(text); bit++) {
+        if (a->errors & (1UL << bit)) {
+            format_age(now - a->error_time[bit], age, sizeof(age));
+            pos += snprintf(text + pos, sizeof(text) - pos, "%s\n  %s\n", jkbms_error_label(bit), age);
+        }
+    }
+    lv_label_set_text(m_ui.alert.body, text);
 }
 
 
@@ -1315,6 +1684,14 @@ void ui_on_button(int step) {
     if (m_ui.sleep_screen != NULL && !lv_obj_has_flag(m_ui.sleep_screen, LV_OBJ_FLAG_HIDDEN)) {
         // the press only cancels going to sleep
         set_visible(m_ui.sleep_screen, false);
+        lvgl_port_unlock();
+        return;
+    }
+    if (m_ui.alert_active) {
+        // any button dismisses the alert; its records are not alerted again
+        m_ui.alert_active = false;
+        alert_mark_seen();
+        ui_render();
         lvgl_port_unlock();
         return;
     }

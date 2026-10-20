@@ -14,7 +14,7 @@ from pathlib import Path
 import serial
 from PIL import Image
 
-SCALE = 2
+SCALE = 1
 
 
 def wait_for(port, text, timeout):
@@ -78,6 +78,8 @@ def main():
     command(port, "n")
     screenshot(port, out_dir / "pack.png")
     command(port, "n")
+    screenshot(port, out_dir / "history.png")
+    command(port, "nn")                 # 7 days, cell 1
     screenshot(port, out_dir / "cell.png")
     command(port, "n" * 8)              # cells 2..8, then errors
     screenshot(port, out_dir / "errors.png")

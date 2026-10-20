@@ -111,7 +111,7 @@ static void add_settings(cJSON *bms, const jkbms_settings_t *s) {
 static void add_logbook(cJSON *bms, const jkbms_status_t *st) {
     cJSON *o = cJSON_AddObjectToObject(bms, "logbook");
     add_number(o, "total", st->logbook_total);
-    add_number(o, "uptime", st->info.uptime_s);
+    add_number(o, "uptime", jkbms_bms_now_s(st));
     cJSON *events = cJSON_AddArrayToObject(o, "events");
     for (int i = 0; i < st->logbook_count; i++) {
         char label[64];

@@ -2,7 +2,8 @@ file (GLOB SOURCES *.c)
 idf_component_register(SRCS ${SOURCES}
                        INCLUDE_DIRS "."
                        REQUIRES jkbms nvs_flash esp_lcd esp_driver_spi esp_driver_gpio esp_timer
-                                esp_wifi esp_netif esp_event esp_http_client json esp_driver_uart)
+                                esp_wifi esp_netif esp_event esp_http_client json esp_driver_uart
+                                esp_partition)
 
 if(NOT CMAKE_BUILD_EARLY_EXPANSION)
     # Build-time secrets: KEY=VALUE lines of the secrets file, overridden by

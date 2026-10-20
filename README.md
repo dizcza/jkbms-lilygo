@@ -11,22 +11,27 @@ The BLE protocol is ported from [esphome-jk-bms](https://github.com/syssi/esphom
 Left button: previous page. Right button: next page. Hold left for 1.5 s to pick
 another BMS.
 
-| Summary | All cells | Pack | Cell |
+| Summary | All cells | Pack | History |
 |:---:|:---:|:---:|:---:|
-| ![summary](docs/screenshots/summary.png) | ![cells](docs/screenshots/cells.png) | ![pack](docs/screenshots/pack.png) | ![cell](docs/screenshots/cell.png) |
-| Pack voltage, current, power, state of charge, the largest cell voltage difference, charge / discharge / balancer state | Voltage of every cell, highest in red, lowest in blue | Temperatures, charge cycles, balancing current | Voltage and resistance of one cell, the selected cell in the bar chart |
+| ![summary](docs/screenshots/summary.png) | ![cells](docs/screenshots/cells.png) | ![pack](docs/screenshots/pack.png) | ![history](docs/screenshots/history.png) |
+| Pack voltage, current, power, state of charge, the largest cell voltage difference, charge / discharge / balancer state | Voltage of every cell, highest in red, lowest in blue | Temperatures, charge cycles, balancing current | SOC and the lowest cell voltage over the last 24 h and 7 days, from the readings stored on the board |
 
-| Errors | Settings | Log | Sleep |
+| Cell | Errors | Settings | Log |
 |:---:|:---:|:---:|:---:|
-| ![errors](docs/screenshots/errors.png) | ![settings](docs/screenshots/settings.png) | ![log](docs/screenshots/log.png) | ![sleep](docs/screenshots/sleep.png) |
-| Active BMS alarms (empty when there are none) | BMS settings: switches, protection voltages, currents, temperatures | The last 50 events of the BMS logbook, newest first | Shown for 2 s before deep sleep; a button press cancels it |
+| ![cell](docs/screenshots/cell.png) | ![errors](docs/screenshots/errors.png) | ![settings](docs/screenshots/settings.png) | ![log](docs/screenshots/log.png) |
+| Voltage and resistance of one cell, the selected cell in the bar chart | Active BMS alarms (empty when there are none) | BMS settings: switches, protection voltages, currents, temperatures | The last 50 events of the BMS logbook, newest first |
 
-| Pick BMS | Connecting |
-|:---:|:---:|
-| ![pick](docs/screenshots/pick.png) | ![connecting](docs/screenshots/connecting.png) |
-| Shown when several BMS are around or after holding the left button | While searching and connecting; errors appear below the spinner |
+| Sleep | Pick BMS | Connecting |
+|:---:|:---:|:---:|
+| ![sleep](docs/screenshots/sleep.png) | ![pick](docs/screenshots/pick.png) | ![connecting](docs/screenshots/connecting.png) |
+| Shown for 2 s before deep sleep; a button press cancels it | Shown when several BMS are around or after holding the left button | While searching and connecting; errors appear below the spinner |
 
 The header turns red and blinks while a BMS reports an active error.
+
+When the board wakes up on a button press and the battery went below 2 % or the BMS reported
+an alarm since the last look, an alert page opens first: when the battery went low, the
+average current in the 3 hours before, the lowest cell and when, when discharging was switched
+off, and each alarm with its time. Any button dismisses it.
 
 ## How it works
 
@@ -36,6 +41,8 @@ The header turns red and blinks while a BMS reports an active error.
   so the firmware sends as few as possible.
 - **Sleep.** After 30 s without a button press the board goes to deep sleep. Either button
   wakes it up.
+- **History.** Every reading is also stored in a 1 MB flash partition (about 3 weeks at one
+  reading a minute), so a drained battery can be inspected without Wi-Fi.
 - **Upload.** Every 60 s the board wakes up with the display off, reads the BMS, POSTs the
   status as JSON over Wi-Fi and goes back to sleep. The settings and the logbook are sent
   with every 10th upload.

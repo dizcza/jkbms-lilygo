@@ -21,6 +21,7 @@
 
 #include "buttons.h"
 #include "console.h"
+#include "history.h"
 #include "jkbms_ble.h"
 #include "lcd.h"
 #include "report.h"
@@ -69,6 +70,24 @@ static void deep_sleep(int64_t sleep_us) {
 
 
 /**
+ * Writes the current readings of all BMS with data to the flash history.
+ * `recorded` (optional) marks the BMS already recorded, to record each once.
+ */
+static void record_history(bool *recorded) {
+    static jkbms_status_t st;  // large: keep it off the stack
+    for (int i = 0; i < JKBMS_DEVICES_MAX; i++) {
+        if ((recorded != NULL && recorded[i]) || !jkbms_ble_get_status(i, &st) || !st.cells_valid) {
+            continue;
+        }
+        history_add(i, &st);
+        if (recorded != NULL) {
+            recorded[i] = true;
+        }
+    }
+}
+
+
+/**
  * True when every assigned BMS has delivered what the report needs, or
  * clearly will not.
  */
@@ -107,6 +126,7 @@ static void report_and_sleep(void) {
     while (with_extras && esp_timer_get_time() - cells_us < REPORT_EXTRAS_WAIT_US && !report_ready(true)) {
         vTaskDelay(pdMS_TO_TICKS(200));
     }
+    record_history(NULL);
     char *json = report_build(m_wake_count, with_extras);
     if (json != NULL) {
         uploader_send(json);
@@ -126,6 +146,7 @@ static void report_and_sleep(void) {
 
 void app_main(void) {
     nvs_init();
+    history_init();
     if (CONFIG_UPLOAD_PERIOD_S > 0 && esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
         report_and_sleep();
     }
@@ -142,9 +163,11 @@ void app_main(void) {
     console_init();
     ESP_LOGI(TAG, "Monitoring %d JK BMS", JKBMS_DEVICES_MAX);
 
+    bool recorded[JKBMS_DEVICES_MAX] = { 0 };  // once per wakeup
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(UI_REFRESH_MS));
         ui_refresh();
+        record_history(recorded);
         if (ui_should_sleep() && ui_show_sleep_screen()) {
             ESP_LOGI(TAG, "Idle, entering deep sleep");
             lcd_sleep();

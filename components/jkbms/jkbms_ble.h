@@ -47,6 +47,7 @@ typedef struct {
     jkbms_proto_t proto;
     bool info_valid;
     jkbms_device_info_t info;
+    int64_t info_time_s;         // board time(NULL) when `info` was received; runs through deep sleep
     bool cells_valid;
     jkbms_cell_info_t cells;
     int64_t cells_updated_us;    // esp_timer_get_time() of the last cell info frame
@@ -122,6 +123,12 @@ void jkbms_ble_forget_saved(void);
  * Disconnects all BMS and makes their slots unassigned (and forgets their data).
  */
 void jkbms_ble_unassign_all(void);
+
+/**
+ * Current BMS uptime in seconds (the time base of the logbook), projected from
+ * the device info and the board clock. 0 if the device info is unknown.
+ */
+uint32_t jkbms_bms_now_s(const jkbms_status_t *status);
 
 const char* jkbms_link_name(jkbms_link_t link);
 

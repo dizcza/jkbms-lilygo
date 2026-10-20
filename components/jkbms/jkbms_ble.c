@@ -13,6 +13,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -86,6 +87,7 @@ typedef struct {
     uint8_t mac[6];
     jkbms_proto_t proto;
     jkbms_device_info_t info;
+    int64_t info_time_s;
 } info_cache_t;
 
 static RTC_DATA_ATTR info_cache_t m_info_cache[JKBMS_DEVICES_MAX];
@@ -469,9 +471,11 @@ static void on_frame(jkbms_slot_t *slot, const uint8_t *frame) {
     case JKBMS_FRAME_TYPE_DEVICE_INFO:
         jkbms_decode_device_info(frame, &slot->st.info);
         slot->st.info_valid = true;
+        slot->st.info_time_s = time(NULL);
         slot->info_this_link = true;
         slot->st.proto = jkbms_proto_from_device_info(&slot->st.info);
-        m_info_cache[idx] = (info_cache_t) { .valid = true, .proto = slot->st.proto, .info = slot->st.info };
+        m_info_cache[idx] = (info_cache_t) { .valid = true, .proto = slot->st.proto, .info = slot->st.info,
+                                             .info_time_s = slot->st.info_time_s };
         memcpy(m_info_cache[idx].mac, slot->st.mac, 6);
         if (slot->st.link != JKBMS_LINK_STREAMING) {
             slot_send_command(slot, JKBMS_COMMAND_CELL_INFO);
@@ -559,6 +563,7 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
         const int idx = slot - m_slots;
         if (!slot->st.info_valid && m_info_cache[idx].valid && memcmp(m_info_cache[idx].mac, slot->st.mac, 6) == 0) {
             slot->st.info = m_info_cache[idx].info;
+            slot->st.info_time_s = m_info_cache[idx].info_time_s;
             slot->st.proto = m_info_cache[idx].proto;
             slot->st.info_valid = true;
         }
@@ -864,6 +869,15 @@ bool jkbms_ble_assign(int idx, const uint8_t mac[6]) {
     }
     xSemaphoreGiveRecursive(m_lock);
     return ok;
+}
+
+
+uint32_t jkbms_bms_now_s(const jkbms_status_t *status) {
+    if (!status->info_valid) {
+        return 0;
+    }
+    const int64_t elapsed = time(NULL) - status->info_time_s;
+    return status->info.uptime_s + (elapsed > 0 ? (uint32_t) elapsed : 0);
 }
 
 
