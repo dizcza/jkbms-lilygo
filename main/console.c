@@ -36,12 +36,6 @@ static void console_task(void *args) {
         case 'L':
             ui_on_button(BUTTON_PREV_LONG);
             break;
-        case 'z':
-            ui_debug_sleep_screen(true);
-            break;
-        case 'Z':
-            ui_debug_sleep_screen(false);
-            break;
         case 's':
             ui_screenshot();
             break;

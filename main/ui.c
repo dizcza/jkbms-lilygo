@@ -4,7 +4,8 @@
  * Pages of every BMS, in order:
  *   summary, all cells at a glance, pack (temperatures, cycles, balancing
  *   current), one page per cell, active errors, settings (several pages),
- *   logbook (several pages, newest events first).
+ *   logbook (several pages, newest events first), board (firmware, Wi-Fi and
+ *   the address of the firmware update page).
  * The header blinks red while any BMS reports an active error.
  * The left/right buttons step through all pages of all BMS with wrap-around.
  */
@@ -22,12 +23,13 @@
 #if CONFIG_UI_SCREENSHOT_CONSOLE
 #include "others/snapshot/lv_snapshot.h"
 #endif
+#include "esp_app_desc.h"
 #include "esp_timer.h"
 #include "buttons.h"
-#include "history.h"
 #include "jkbms_ble.h"
-#include "nvs.h"
 #include "lcd.h"
+#include "uploader.h"
+#include "webserver.h"
 
 #define COLOR_BG          0x000000
 #define COLOR_HEADER      0x202830
@@ -48,19 +50,7 @@
 #define CHART_X           4
 #define CHART_W           (LCD_H_RES - 2 * CHART_X)
 
-#define NO_DATA_SLEEP_US  (30 * 1000000LL)
-
 #define SPINNER_SIZE      100
-
-#define HISTORY_PAGES     2          // 24 hours, 7 days
-#define HISTORY_POINTS    120
-#define ALERT_SOC         2          // %: alert when the battery got this low
-#define ALERT_BEFORE_S    (3 * 3600) // average current over this time before going low
-#define ALERT_NVS_KEY     "seen_seq" // history records already shown in an alert
-
-#define SLEEP_SCREEN_US   (2 * 1000000LL)
-#define COLOR_MOON        0xFFE082
-#define COLOR_SLEEP_Z     0x90CAF9
 
 // LiFePO4 cell voltage range of the per-cell bar chart before the BMS settings arrive
 #define CHART_DEFAULT_LO  2.5f
@@ -75,6 +65,9 @@
 #define SETTINGS_ROW_H    47
 #define SETTINGS_MAX      32
 
+#define BOARD_ROWS        3          // firmware, Wi-Fi, update address
+#define BOARD_ROW_H       62
+
 #define PICKER_ROWS       5
 #define PICKER_HINT_H     22         // the hint line below the list
 #define PICKER_MAX_AGE_US (60 * 1000000LL)  // results of a search this recent are reused
@@ -87,12 +80,12 @@ typedef enum {
 typedef enum {
     PAGE_SUMMARY,
     PAGE_PACK,
-    PAGE_HISTORY,
     PAGE_CELLS,
     PAGE_CELL,
     PAGE_ERRORS,
     PAGE_SETTINGS,
     PAGE_LOG,
+    PAGE_BOARD,
     PAGE_NODATA,
 } page_kind_t;
 
@@ -145,50 +138,6 @@ typedef struct {
 typedef struct {
     lv_obj_t *cont;
     lv_obj_t *title;
-    lv_obj_t *chart;
-    lv_chart_series_t *soc;
-    lv_chart_series_t *cell;
-    lv_obj_t *legend_soc;
-    lv_obj_t *legend_cell;
-    lv_obj_t *range;
-    // cached chart data, recomputed when the key changes
-    int32_t soc_points[HISTORY_POINTS];
-    int32_t cell_points[HISTORY_POINTS];
-    uint16_t cell_lo_mv;
-    uint16_t cell_hi_mv;
-    int cache_bms;
-    int cache_page;
-    uint32_t cache_seq;
-} history_page_t;
-
-typedef struct {
-    lv_obj_t *cont;
-    lv_obj_t *title;
-    lv_obj_t *body;
-    lv_obj_t *hint;
-} alert_page_t;
-
-// what happened while nobody was looking, from the flash history
-typedef struct {
-    bool show;
-    int slot;
-    uint32_t newest_time;
-    bool low;
-    uint32_t low_time;          // oldest record below ALERT_SOC
-    uint16_t lowest_mv;
-    uint8_t lowest_cell;
-    uint32_t lowest_time;
-    bool dsg_off;
-    uint32_t dsg_off_time;      // oldest record with the discharge switch off
-    uint32_t errors;
-    uint32_t error_time[32];    // oldest record with each alarm bit
-    bool avg_valid;
-    float avg_current;          // A, over ALERT_BEFORE_S before going low
-} alert_info_t;
-
-typedef struct {
-    lv_obj_t *cont;
-    lv_obj_t *title;
     lv_obj_t *names[SETTINGS_ROWS];
     lv_obj_t *values[SETTINGS_ROWS];
 } settings_page_t;
@@ -230,16 +179,15 @@ static struct {
     lv_obj_t *header;
     lv_obj_t *header_title;
     lv_obj_t *header_state;
+    lv_obj_t *header_wifi;
+    lv_obj_t *header_wifi_cross;
     summary_page_t summary;
     pack_page_t pack;
     cells_page_t cells;
     cell_page_t cell_page;
     errors_page_t errors;
-    history_page_t history;
-    alert_page_t alert;
-    alert_info_t alert_info;
-    bool alert_active;
     settings_page_t settings;
+    settings_page_t board;
     log_page_t log;
     nodata_page_t nodata;
     picker_page_t picker;
@@ -255,13 +203,14 @@ static struct {
     int cursor;
     bool picker_touched;
     bool picker_manual;      // opened by the user: always show the list
+    bool picker_board;       // no BMS found: the board page instead of "no BMS"
     int64_t picker_start_us;
     lv_obj_t *no_bms;        // full-screen "no BMS" image
-    // deep sleep
-    lv_obj_t *sleep_screen;
+    // firmware update progress over everything
+    lv_obj_t *ota_cont;
+    lv_obj_t *ota_label;
+    lv_obj_t *ota_bar;
     bool anonymize;          // screenshots: show made-up BMS names and MACs
-    int64_t last_button_us;
-    int64_t data_shown_us;   // when BMS data was first shown, 0 before
 } m_ui;
 
 extern const lv_image_dsc_t ohm_glyph;
@@ -270,13 +219,7 @@ static void create_picker_page(lv_obj_t *scr);
 static void ui_fetch_status(void);
 static void enter_monitor(void);
 static int first_free_slot(void);
-static void create_history_page(lv_obj_t *scr);
-static void create_alert_page(lv_obj_t *scr);
-static void update_history(const jkbms_status_t *st, int history_page);
-static void update_alert(void);
 static int assigned_count(void);
-static void alert_compute(void);
-static void alert_mark_seen(void);
 
 static jkbms_status_t m_status[JKBMS_DEVICES_MAX];
 
@@ -417,6 +360,21 @@ static void create_settings_page(lv_obj_t *scr) {
 }
 
 
+static void create_board_page(lv_obj_t *scr) {
+    settings_page_t *p = &m_ui.board;
+    p->cont = make_container(scr, HEADER_H, CONTENT_H);
+    p->title = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 4, 2);
+    lv_label_set_text(p->title, "Board");
+    for (int i = 0; i < BOARD_ROWS; i++) {
+        const int y = 30 + i * BOARD_ROW_H;
+        p->names[i] = make_label(p->cont, &lv_font_montserrat_16, COLOR_DIM, 4, y);
+        p->values[i] = make_label(p->cont, &lv_font_montserrat_16, COLOR_TEXT, 4, y + 20);
+        lv_obj_set_width(p->values[i], LCD_H_RES - 8);
+        lv_label_set_long_mode(p->values[i], LV_LABEL_LONG_WRAP);
+    }
+}
+
+
 static void create_log_page(lv_obj_t *scr) {
     log_page_t *p = &m_ui.log;
     p->cont = make_container(scr, HEADER_H, CONTENT_H);
@@ -535,10 +493,9 @@ static void hide_pages(void) {
     set_visible(m_ui.cells.cont, false);
     set_visible(m_ui.cell_page.cont, false);
     set_visible(m_ui.errors.cont, false);
-    set_visible(m_ui.history.cont, false);
-    set_visible(m_ui.alert.cont, false);
     set_visible(m_ui.settings.cont, false);
     set_visible(m_ui.log.cont, false);
+    set_visible(m_ui.board.cont, false);
     set_visible(m_ui.nodata.cont, false);
     set_visible(m_ui.picker.cont, false);
     set_visible(m_ui.chart, false);
@@ -566,16 +523,25 @@ void ui_init(lv_display_t *disp) {
     lv_obj_set_style_bg_opa(m_ui.header_state, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_color(m_ui.header_state, lv_color_hex(COLOR_WARN), 0);
     lv_obj_align(m_ui.header_state, LV_ALIGN_RIGHT_MID, -6, 0);
+    m_ui.header_wifi = make_label(header, &lv_font_montserrat_16, COLOR_TEXT, 0, 0);
+    lv_label_set_text(m_ui.header_wifi, LV_SYMBOL_WIFI);
+    lv_obj_align(m_ui.header_wifi, LV_ALIGN_RIGHT_MID, -28, 0);
+    // a red slash over the icon while Wi-Fi is down
+    static const lv_point_precise_t cross[] = { { 2, 16 }, { 18, 1 } };
+    m_ui.header_wifi_cross = lv_line_create(m_ui.header_wifi);
+    lv_line_set_points(m_ui.header_wifi_cross, cross, 2);
+    lv_obj_set_style_line_width(m_ui.header_wifi_cross, 2, 0);
+    lv_obj_set_style_line_color(m_ui.header_wifi_cross, lv_color_hex(COLOR_ERROR), 0);
+    lv_obj_set_style_line_rounded(m_ui.header_wifi_cross, true, 0);
 
     create_summary_page(scr);
     create_pack_page(scr);
-    create_history_page(scr);
-    create_alert_page(scr);
     create_cells_page(scr);
     create_cell_page(scr);
     create_errors_page(scr);
     create_settings_page(scr);
     create_log_page(scr);
+    create_board_page(scr);
     create_nodata_page(scr);
     create_picker_page(scr);
     create_chart(scr);
@@ -591,7 +557,6 @@ void ui_init(lv_display_t *disp) {
     }
     if (any_assigned) {
         enter_monitor();
-        alert_compute();
     } else {
         m_ui.mode = UI_MODE_PICKER;
         jkbms_ble_set_discovery(true);
@@ -750,10 +715,10 @@ static int log_pages(int bms) {
 
 static int page_count(int bms) {
     if (!has_data(bms)) {
-        return 1;
+        return 2;  // waiting or "no BMS", board
     }
-    // summary + cells + pack + history pages + N cell pages + errors + settings pages + logbook pages
-    return 3 + HISTORY_PAGES + m_status[bms].cells.cell_count + 1 + settings_pages(bms) + log_pages(bms);
+    // summary + cells + pack + N cell pages + errors + settings pages + logbook pages + board
+    return 3 + m_status[bms].cells.cell_count + 1 + settings_pages(bms) + log_pages(bms) + 1;
 }
 
 
@@ -764,7 +729,8 @@ static int page_count(int bms) {
 static page_kind_t page_kind(int bms, int page, int *index) {
     *index = 0;
     if (!has_data(bms)) {
-        return PAGE_NODATA;
+        // the board page shows where to update the firmware, BMS or not
+        return page == 0 ? PAGE_NODATA : PAGE_BOARD;
     }
     const int cells = m_status[bms].cells.cell_count;
     if (page == 0) {
@@ -777,11 +743,6 @@ static page_kind_t page_kind(int bms, int page, int *index) {
         return PAGE_PACK;
     }
     int first = 3;
-    if (page < first + HISTORY_PAGES) {
-        *index = page - first;
-        return PAGE_HISTORY;
-    }
-    first += HISTORY_PAGES;
     if (page < first + cells) {
         *index = page - first;
         return PAGE_CELL;
@@ -796,8 +757,12 @@ static page_kind_t page_kind(int bms, int page, int *index) {
         *index = page - first;
         return PAGE_SETTINGS;
     }
-    *index = page - first - settings;
-    return PAGE_LOG;
+    first += settings;
+    if (page < first + log_pages(bms)) {
+        *index = page - first;
+        return PAGE_LOG;
+    }
+    return PAGE_BOARD;
 }
 
 
@@ -819,6 +784,15 @@ static bool has_error(const jkbms_status_t *st) {
         }
     }
     return false;
+}
+
+
+static void update_wifi_icon(void) {
+    char ssid[33];
+    char ip[16];
+    const bool online = uploader_get_network(ssid, sizeof(ssid), ip, sizeof(ip));
+    set_color(m_ui.header_wifi, online ? COLOR_TEXT : COLOR_DIM);
+    set_visible(m_ui.header_wifi_cross, !online);
 }
 
 
@@ -1122,6 +1096,25 @@ static void update_nodata(const jkbms_status_t *st) {
 }
 
 
+static void update_board(void) {
+    settings_page_t *p = &m_ui.board;
+    char ssid[33];
+    char ip[16];
+    const bool online = uploader_get_network(ssid, sizeof(ssid), ip, sizeof(ip));
+    lv_label_set_text(p->names[0], "Firmware");
+    lv_label_set_text(p->values[0], esp_app_get_description()->version);
+    lv_label_set_text(p->names[1], "Wi-Fi");
+    lv_label_set_text(p->values[1], online ? ssid : "not connected");
+    set_color(p->values[1], online ? COLOR_TEXT : COLOR_WARN);
+    lv_label_set_text(p->names[2], "Update at");
+    if (online) {
+        set_text(p->values[2], WEBSERVER_HOSTNAME ".local\n%s", ip);
+    } else {
+        lv_label_set_text(p->values[2], "-");
+    }
+}
+
+
 static void ui_render(void) {
     const jkbms_status_t *st = &m_status[m_ui.bms];
     if (m_ui.page >= page_count(m_ui.bms)) {
@@ -1129,26 +1122,14 @@ static void ui_render(void) {
     }
 
     hide_pages();
-    if (m_ui.alert_active) {
-        set_visible(m_ui.header, false);
-        update_alert();
-        set_visible(m_ui.alert.cont, true);
-        return;
-    }
     set_visible(m_ui.header, true);
     update_header(st);
-    if (has_data(m_ui.bms) && m_ui.data_shown_us == 0) {
-        m_ui.data_shown_us = esp_timer_get_time();
-    }
+    update_wifi_icon();
     int index;
     switch (page_kind(m_ui.bms, m_ui.page, &index)) {
     case PAGE_SUMMARY:
         update_summary(st);
         set_visible(m_ui.summary.cont, true);
-        break;
-    case PAGE_HISTORY:
-        update_history(st, index);
-        set_visible(m_ui.history.cont, true);
         break;
     case PAGE_PACK:
         update_pack(st);
@@ -1174,288 +1155,15 @@ static void ui_render(void) {
         update_log(st, index);
         set_visible(m_ui.log.cont, true);
         break;
+    case PAGE_BOARD:
+        update_board();
+        set_visible(m_ui.board.cont, true);
+        break;
     case PAGE_NODATA:
         update_nodata(st);
         set_visible(m_ui.nodata.cont, true);
         break;
     }
-}
-
-
-/*---------------------------------------------------------------
-        History charts and the drain alert
----------------------------------------------------------------*/
-
-static void create_history_page(lv_obj_t *scr) {
-    history_page_t *p = &m_ui.history;
-    p->cont = make_container(scr, HEADER_H, CONTENT_H);
-    p->title = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 4, 2);
-
-    p->chart = lv_chart_create(p->cont);
-    lv_obj_set_pos(p->chart, 2, 30);
-    lv_obj_set_size(p->chart, LCD_H_RES - 4, 130);
-    lv_chart_set_type(p->chart, LV_CHART_TYPE_LINE);
-    lv_chart_set_point_count(p->chart, HISTORY_POINTS);
-    lv_chart_set_div_line_count(p->chart, 5, 0);
-    lv_chart_set_range(p->chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
-    lv_obj_set_style_bg_opa(p->chart, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(p->chart, 0, 0);
-    lv_obj_set_style_pad_all(p->chart, 0, 0);
-    lv_obj_set_style_pad_hor(p->chart, 4, 0);  // room for the point markers at the edges
-    lv_obj_set_style_line_color(p->chart, lv_color_hex(COLOR_HEADER), LV_PART_MAIN);
-    lv_obj_set_style_line_width(p->chart, 2, LV_PART_ITEMS);
-    // small point markers: a few records do not make a line yet
-    lv_obj_set_style_size(p->chart, 4, 4, LV_PART_INDICATOR);
-    p->soc = lv_chart_add_series(p->chart, lv_color_hex(COLOR_OK), LV_CHART_AXIS_PRIMARY_Y);
-    p->cell = lv_chart_add_series(p->chart, lv_color_hex(COLOR_MIN), LV_CHART_AXIS_SECONDARY_Y);
-
-    p->legend_soc = make_label(p->cont, &lv_font_montserrat_14, COLOR_OK, 4, 166);
-    lv_label_set_text(p->legend_soc, "SOC");
-    p->legend_cell = make_label(p->cont, &lv_font_montserrat_14, COLOR_MIN, 44, 166);
-    lv_label_set_text(p->legend_cell, "lowest cell");
-    p->range = make_label(p->cont, &lv_font_montserrat_14, COLOR_DIM, 4, 186);
-    p->cache_bms = -1;
-}
-
-
-typedef struct {
-    int slot;
-    uint32_t now;
-    uint32_t window;
-    history_page_t *page;
-} history_chart_ctx_t;
-
-
-static bool history_chart_cb(const history_record_t *r, void *arg) {
-    history_chart_ctx_t *ctx = arg;
-    if (r->time_s > ctx->now) {
-        return true;  // recorded with a newer device info: ignore
-    }
-    const uint32_t age = ctx->now - r->time_s;
-    if (age >= ctx->window) {
-        return false;
-    }
-    if (r->slot != ctx->slot) {
-        return true;
-    }
-    history_page_t *p = ctx->page;
-    const int i = HISTORY_POINTS - 1 - (int) ((uint64_t) age * HISTORY_POINTS / ctx->window);
-    // records come newest first: keep the newest SOC and the lowest cell of each point
-    if (p->soc_points[i] == LV_CHART_POINT_NONE) {
-        p->soc_points[i] = r->soc;
-    }
-    if (p->cell_points[i] == LV_CHART_POINT_NONE || r->min_mv < p->cell_points[i]) {
-        p->cell_points[i] = r->min_mv;
-    }
-    if (r->min_mv < p->cell_lo_mv) {
-        p->cell_lo_mv = r->min_mv;
-    }
-    if (r->min_mv > p->cell_hi_mv) {
-        p->cell_hi_mv = r->min_mv;
-    }
-    return true;
-}
-
-
-static void update_history(const jkbms_status_t *st, int history_page) {
-    history_page_t *p = &m_ui.history;
-    const uint32_t window = (history_page == 0) ? 86400 : 7 * 86400;
-    lv_label_set_text(p->title, history_page == 0 ? "Last 24 h" : "Last 7 days");
-
-    const uint32_t seq = history_last_seq();
-    if (p->cache_bms != m_ui.bms || p->cache_page != history_page || p->cache_seq != seq) {
-        p->cache_bms = m_ui.bms;
-        p->cache_page = history_page;
-        p->cache_seq = seq;
-        for (int i = 0; i < HISTORY_POINTS; i++) {
-            p->soc_points[i] = LV_CHART_POINT_NONE;
-            p->cell_points[i] = LV_CHART_POINT_NONE;
-        }
-        p->cell_lo_mv = UINT16_MAX;
-        p->cell_hi_mv = 0;
-        history_chart_ctx_t ctx = { .slot = m_ui.bms, .now = jkbms_bms_now_s(st), .window = window, .page = p };
-        if (ctx.now > 0) {
-            history_foreach(history_chart_cb, &ctx);
-        }
-    }
-
-    // cell voltage scale from the protection limits, like the bar chart
-    int32_t lo = (int32_t) (CHART_DEFAULT_LO * 1000);
-    int32_t hi = (int32_t) (CHART_DEFAULT_HI * 1000);
-    if (st->settings_valid && st->settings.cell_ovp > st->settings.cell_uvp) {
-        lo = (int32_t) (st->settings.cell_uvp * 1000);
-        hi = (int32_t) (st->settings.cell_ovp * 1000);
-    }
-    lv_chart_set_range(p->chart, LV_CHART_AXIS_SECONDARY_Y, lo, hi);
-    for (int i = 0; i < HISTORY_POINTS; i++) {
-        lv_chart_set_value_by_id(p->chart, p->soc, i, p->soc_points[i]);
-        lv_chart_set_value_by_id(p->chart, p->cell, i, p->cell_points[i]);
-    }
-    lv_chart_refresh(p->chart);
-    if (p->cell_hi_mv == 0) {
-        lv_label_set_text(p->range, "No records yet");
-    } else {
-        set_text(p->range, "cell %.2f-%.2f V", p->cell_lo_mv / 1000.0f, p->cell_hi_mv / 1000.0f);
-    }
-}
-
-
-static void create_alert_page(lv_obj_t *scr) {
-    alert_page_t *p = &m_ui.alert;
-    p->cont = make_container(scr, 0, LCD_V_RES);
-    p->title = make_label(p->cont, &lv_font_montserrat_28, COLOR_ERROR, 4, 2);
-    lv_label_set_text(p->title, LV_SYMBOL_WARNING " Alert");
-    p->body = make_label(p->cont, &lv_font_montserrat_14, COLOR_TEXT, 4, 40);
-    lv_obj_set_width(p->body, LCD_H_RES - 8);
-    lv_label_set_long_mode(p->body, LV_LABEL_LONG_WRAP);
-    p->hint = make_label(p->cont, &lv_font_montserrat_14, COLOR_DIM, 4, LCD_V_RES - 20);
-    lv_label_set_text(p->hint, "Press any button");
-}
-
-
-static uint32_t alert_seen_seq(void) {
-    uint32_t seen = 0;
-    nvs_handle_t handle;
-    if (nvs_open("jkbms", NVS_READONLY, &handle) == ESP_OK) {
-        nvs_get_u32(handle, ALERT_NVS_KEY, &seen);
-        nvs_close(handle);
-    }
-    return seen;
-}
-
-
-static void alert_mark_seen(void) {
-    nvs_handle_t handle;
-    if (nvs_open("jkbms", NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_set_u32(handle, ALERT_NVS_KEY, history_last_seq());
-        nvs_commit(handle);
-        nvs_close(handle);
-    }
-}
-
-
-static bool alert_scan_cb(const history_record_t *r, void *arg) {
-    alert_info_t *a = arg;
-    if (a->newest_time == 0) {
-        a->newest_time = r->time_s;
-    }
-    // records come newest first: overwriting keeps the oldest occurrence
-    if (r->soc < ALERT_SOC) {
-        a->low = true;
-        a->low_time = r->time_s;
-        a->slot = r->slot;
-    }
-    if (a->lowest_mv == 0 || r->min_mv < a->lowest_mv) {
-        a->lowest_mv = r->min_mv;
-        a->lowest_cell = r->min_cell;
-        a->lowest_time = r->time_s;
-    }
-    if (!(r->flags & HISTORY_FLAG_DISCHARGING)) {
-        a->dsg_off = true;
-        a->dsg_off_time = r->time_s;
-    }
-    for (uint8_t bit = 0; bit < 32; bit++) {
-        // "Battery is fully charged" (bit 4) is a status, not an error
-        if ((r->errors & (1UL << bit)) && bit != 4 && jkbms_error_label(bit) != NULL) {
-            a->errors |= 1UL << bit;
-            a->error_time[bit] = r->time_s;
-            a->slot = r->slot;
-        }
-    }
-    return true;
-}
-
-
-typedef struct {
-    alert_info_t *alert;
-    uint32_t seen;
-    int count;
-    float sum;
-} alert_ctx_t;
-
-
-static bool alert_unseen_cb(const history_record_t *r, void *arg) {
-    alert_ctx_t *ctx = arg;
-    if (r->seq <= ctx->seen) {
-        return false;
-    }
-    return alert_scan_cb(r, ctx->alert);
-}
-
-
-static bool alert_average_cb(const history_record_t *r, void *arg) {
-    alert_ctx_t *ctx = arg;
-    const uint32_t low = ctx->alert->low_time;
-    if (r->time_s + ALERT_BEFORE_S < low) {
-        return false;
-    }
-    if (r->time_s < low && r->slot == ctx->alert->slot) {
-        ctx->sum += r->current_ca / 100.0f;
-        ctx->count++;
-    }
-    return true;
-}
-
-
-/**
- * Looks for a low battery or alarms in the records not alerted yet.
- */
-static void alert_compute(void) {
-    alert_info_t *a = &m_ui.alert_info;
-    memset(a, 0, sizeof(*a));
-    alert_ctx_t ctx = { .alert = a, .seen = alert_seen_seq() };
-    history_foreach(alert_unseen_cb, &ctx);
-    a->show = a->low || a->errors != 0;
-    if (a->low) {
-        ctx.count = 0;
-        ctx.sum = 0;
-        history_foreach(alert_average_cb, &ctx);
-        a->avg_valid = ctx.count > 0;
-        a->avg_current = ctx.count > 0 ? ctx.sum / ctx.count : 0;
-    }
-    m_ui.alert_active = a->show;
-    if (a->show) {
-        m_ui.bms = a->slot;
-    }
-}
-
-
-static void update_alert(void) {
-    const alert_info_t *a = &m_ui.alert_info;
-    // ages relative to the BMS clock now, or to the newest record before the BMS answers
-    uint32_t now = jkbms_bms_now_s(&m_status[a->slot]);
-    if (now < a->newest_time) {
-        now = a->newest_time;
-    }
-    char text[640];
-    char age[24];
-    size_t pos = 0;
-    if (assigned_count() > 1) {
-        pos += snprintf(text + pos, sizeof(text) - pos, "BMS %d\n", a->slot + 1);
-    }
-    if (a->low) {
-        format_age(now - a->low_time, age, sizeof(age));
-        pos += snprintf(text + pos, sizeof(text) - pos, "Battery below %d%%\n  %s\n", ALERT_SOC, age);
-        if (a->avg_valid) {
-            pos += snprintf(text + pos, sizeof(text) - pos, "Avg 3 h before\n  %+.2f A\n", a->avg_current);
-        }
-    }
-    if (a->lowest_mv > 0) {
-        format_age(now - a->lowest_time, age, sizeof(age));
-        pos += snprintf(text + pos, sizeof(text) - pos, "Lowest cell #%u\n  %.3f V, %s\n", a->lowest_cell,
-                        a->lowest_mv / 1000.0f, age);
-    }
-    if (a->dsg_off) {
-        format_age(now - a->dsg_off_time, age, sizeof(age));
-        pos += snprintf(text + pos, sizeof(text) - pos, "Discharge OFF\n  %s\n", age);
-    }
-    for (uint8_t bit = 0; bit < 32 && pos < sizeof(text); bit++) {
-        if (a->errors & (1UL << bit)) {
-            format_age(now - a->error_time[bit], age, sizeof(age));
-            pos += snprintf(text + pos, sizeof(text) - pos, "%s\n  %s\n", jkbms_error_label(bit), age);
-        }
-    }
-    lv_label_set_text(m_ui.alert.body, text);
 }
 
 
@@ -1619,8 +1327,11 @@ static void picker_button(int step) {
     picker_fetch();
     const int items = picker_items();
     if (items == 0) {
+        // nothing to pick: either button toggles the board page
+        m_ui.picker_board = !m_ui.picker_board;
         return;
     }
+    m_ui.picker_board = false;
     if (m_ui.cursor >= items) {
         m_ui.cursor = 0;
     }
@@ -1670,6 +1381,7 @@ static void picker_render(void) {
     lv_obj_align(m_ui.header_title, LV_ALIGN_LEFT_MID, 6, 0);
 
     set_visible(m_ui.header, true);
+    update_wifi_icon();
     set_visible(p->list, show_list);
     set_visible(p->hint, show_list);
     if (show_list) {
@@ -1678,6 +1390,12 @@ static void picker_render(void) {
         lv_label_set_text(p->message_hint, "");
     } else if (picker_scanning()) {
         show_waiting(p->spinner, p->message, p->message_hint, "", "", false);
+    } else if (m_ui.picker_board) {
+        set_visible(p->spinner, false);
+        lv_label_set_text(p->message, "");
+        lv_label_set_text(p->message_hint, "");
+        update_board();
+        set_visible(m_ui.board.cont, true);
     } else {
         set_visible(m_ui.header, false);
         set_visible(m_ui.no_bms, true);
@@ -1730,21 +1448,6 @@ static void picker_render(void) {
 
 void ui_on_button(int step) {
     lvgl_port_lock(0);
-    m_ui.last_button_us = esp_timer_get_time();
-    if (m_ui.sleep_screen != NULL && !lv_obj_has_flag(m_ui.sleep_screen, LV_OBJ_FLAG_HIDDEN)) {
-        // the press only cancels going to sleep
-        set_visible(m_ui.sleep_screen, false);
-        lvgl_port_unlock();
-        return;
-    }
-    if (m_ui.alert_active) {
-        // any button dismisses the alert; its records are not alerted again
-        m_ui.alert_active = false;
-        alert_mark_seen();
-        ui_render();
-        lvgl_port_unlock();
-        return;
-    }
     if (step == BUTTON_PREV_LONG) {
         // forget the saved BMS and show the list of BMS around
         jkbms_ble_forget_saved();
@@ -1754,7 +1457,6 @@ void ui_on_button(int step) {
         m_ui.picker_touched = false;
         m_ui.picker_start_us = esp_timer_get_time();
         m_ui.cursor = 0;
-        m_ui.data_shown_us = 0;
         jkbms_ble_set_discovery(true);
         ui_fetch_status();
         picker_fetch();
@@ -1782,64 +1484,48 @@ void ui_on_button(int step) {
 
 
 /**
- * Full-screen crescent moon with "z Z Z" on black, drawn with LVGL objects.
+ * Full-screen "Updating firmware" with a progress bar, on the top layer.
  */
-static void create_sleep_screen(void) {
-    lv_obj_t *scr = lv_layer_top();
-    lv_obj_t *cont = lv_obj_create(scr);
+static void create_ota_screen(void) {
+    lv_obj_t *cont = lv_obj_create(lv_layer_top());
     lv_obj_remove_style_all(cont);
     lv_obj_set_size(cont, LCD_H_RES, LCD_V_RES);
     lv_obj_set_style_bg_color(cont, lv_color_hex(COLOR_BG), 0);
     lv_obj_set_style_bg_opa(cont, LV_OPA_COVER, 0);
     lv_obj_remove_flag(cont, LV_OBJ_FLAG_SCROLLABLE);
 
-    // a crescent: a yellow disc partly covered by a black one
-    const struct { int x, y, d; uint32_t color; } discs[] = {
-        { 12, 104, 84, COLOR_MOON },
-        { 40, 88, 76, COLOR_BG },
-    };
-    for (int i = 0; i < 2; i++) {
-        lv_obj_t *disc = lv_obj_create(cont);
-        lv_obj_remove_style_all(disc);
-        lv_obj_set_pos(disc, discs[i].x, discs[i].y);
-        lv_obj_set_size(disc, discs[i].d, discs[i].d);
-        lv_obj_set_style_radius(disc, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_color(disc, lv_color_hex(discs[i].color), 0);
-        lv_obj_set_style_bg_opa(disc, LV_OPA_COVER, 0);
-    }
+    lv_obj_t *title = make_label(cont, &lv_font_montserrat_20, COLOR_TEXT, 0, 0);
+    lv_obj_set_width(title, LCD_H_RES);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(title, "Updating\nfirmware");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 60);
 
-    const struct { const char *text; const lv_font_t *font; int x, y; } zs[] = {
-        { "z", &lv_font_montserrat_20, 78, 92 },
-        { "Z", &lv_font_montserrat_28, 92, 56 },
-        { "Z", &lv_font_montserrat_40, 100, 10 },
-    };
-    for (int i = 0; i < 3; i++) {
-        lv_obj_t *z = make_label(cont, zs[i].font, COLOR_SLEEP_Z, zs[i].x, zs[i].y);
-        lv_label_set_text(z, zs[i].text);
-    }
-    set_visible(cont, false);
-    m_ui.sleep_screen = cont;
+    m_ui.ota_bar = lv_bar_create(cont);
+    lv_obj_set_size(m_ui.ota_bar, LCD_H_RES - 20, 16);
+    lv_obj_align(m_ui.ota_bar, LV_ALIGN_TOP_MID, 0, 126);
+    lv_bar_set_range(m_ui.ota_bar, 0, 100);
+    lv_obj_set_style_bg_color(m_ui.ota_bar, lv_color_hex(COLOR_HEADER), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(m_ui.ota_bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(m_ui.ota_bar, lv_color_hex(COLOR_OK), LV_PART_INDICATOR);
+
+    m_ui.ota_label = make_label(cont, &lv_font_montserrat_28, COLOR_TEXT, 0, 0);
+    lv_obj_align(m_ui.ota_label, LV_ALIGN_TOP_MID, 0, 152);
+    m_ui.ota_cont = cont;
 }
 
 
-bool ui_show_sleep_screen(void) {
+void ui_ota_progress(int percent) {
     lvgl_port_lock(0);
-    if (m_ui.sleep_screen == NULL) {
-        create_sleep_screen();
+    if (m_ui.ota_cont == NULL) {
+        create_ota_screen();
     }
-    set_visible(m_ui.sleep_screen, true);
+    set_visible(m_ui.ota_cont, percent >= 0);
+    if (percent >= 0) {
+        lv_bar_set_value(m_ui.ota_bar, percent, LV_ANIM_OFF);
+        set_text(m_ui.ota_label, "%d %%", percent);
+        lv_obj_align(m_ui.ota_label, LV_ALIGN_TOP_MID, 0, 152);
+    }
     lvgl_port_unlock();
-    const int64_t shown = esp_timer_get_time();
-    while (esp_timer_get_time() - shown < SLEEP_SCREEN_US) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        lvgl_port_lock(0);
-        const bool visible = !lv_obj_has_flag(m_ui.sleep_screen, LV_OBJ_FLAG_HIDDEN);
-        lvgl_port_unlock();
-        if (!visible) {
-            return false;
-        }
-    }
-    return true;
 }
 
 
@@ -1851,26 +1537,13 @@ void ui_debug_anonymize(bool enable) {
 }
 
 
-void ui_debug_sleep_screen(bool show) {
-    lvgl_port_lock(0);
-    m_ui.last_button_us = esp_timer_get_time();
-    if (m_ui.sleep_screen == NULL) {
-        create_sleep_screen();
-    }
-    set_visible(m_ui.sleep_screen, show);
-    lvgl_port_unlock();
-}
-
-
 /**
  * Prints the screen as "SHOT <w> <h>", one hex RGB565 row per line, "END".
  */
 void ui_screenshot(void) {
     lvgl_port_lock(0);
-    m_ui.last_button_us = esp_timer_get_time();
-    const bool sleeping = m_ui.sleep_screen != NULL && !lv_obj_has_flag(m_ui.sleep_screen, LV_OBJ_FLAG_HIDDEN);
-    lv_draw_buf_t *snap = lv_snapshot_take(sleeping ? m_ui.sleep_screen : lv_screen_active(),
-                                           LV_COLOR_FORMAT_RGB565);
+    const bool ota = m_ui.ota_cont != NULL && !lv_obj_has_flag(m_ui.ota_cont, LV_OBJ_FLAG_HIDDEN);
+    lv_draw_buf_t *snap = lv_snapshot_take(ota ? m_ui.ota_cont : lv_screen_active(), LV_COLOR_FORMAT_RGB565);
     lvgl_port_unlock();
     if (snap == NULL) {
         printf("SHOT ERROR\n");
@@ -1890,20 +1563,6 @@ void ui_screenshot(void) {
     lv_draw_buf_destroy(snap);
 }
 #endif
-
-
-bool ui_should_sleep(void) {
-    if (CONFIG_UI_SLEEP_IDLE_S == 0 || m_ui.mode == UI_MODE_PICKER) {
-        return false;
-    }
-    const int64_t now = esp_timer_get_time();
-    if (m_ui.data_shown_us == 0) {
-        // give up waiting for the BMS; a button press tries again
-        return now > NO_DATA_SLEEP_US && now - m_ui.last_button_us > NO_DATA_SLEEP_US;
-    }
-    const int64_t since = (m_ui.last_button_us > m_ui.data_shown_us) ? m_ui.last_button_us : m_ui.data_shown_us;
-    return now - since > CONFIG_UI_SLEEP_IDLE_S * 1000000LL;
-}
 
 
 void ui_refresh(void) {

@@ -15,10 +15,15 @@
 #include <stdint.h>
 
 /**
- * Returns a JSON string to be freed with free(). Settings and the logbook
- * are included only when `with_extras` is set.
+ * Returns a JSON string to be freed with free(). Settings are included only
+ * when `with_extras` is set; logbook events whenever there are new ones.
  */
 char* report_build(uint32_t wake, bool with_extras);
+
+/**
+ * The last built report was delivered: its logbook events are not sent again.
+ */
+void report_mark_sent(void);
 
 #ifdef __cplusplus
 }

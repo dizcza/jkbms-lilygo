@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>JK BMS monitor</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #12161b; color: #e6edf3; margin: 0; padding: 24px 16px; }
+  main { max-width: 480px; margin: 0 auto; }
+  h2 { margin-top: 0; }
+  .dim { color: #8a949e; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 20px 0 12px; }
+  input[type=file] { flex: 1; min-width: 0; color: #e6edf3; }
+  button { padding: 8px 18px; font-size: 15px; border: 0; border-radius: 6px; background: #3ddc84; color: #12161b; cursor: pointer; }
+  button:disabled { background: #45607a; color: #8a949e; cursor: default; }
+  progress { width: 100%; height: 18px; accent-color: #3ddc84; }
+  #status { margin-top: 8px; min-height: 1.4em; }
+  .error { color: #ff5252; }
+  .ok { color: #3ddc84; }
+</style>
+</head>
+<body>
+<main>
+<h2>Firmware update</h2>
+<div class="dim">Running firmware <span id="version">…</span></div>
+
+<div class="row">
+  <input id="choose_firmware" type="file" accept=".bin">
+  <button id="upload_firmware" type="button" onclick="uploadFirmware()">Upload</button>
+</div>
+<progress id="progress" max="100" value="0" hidden></progress>
+<div id="status"></div>
+</main>
+
+<script>
+const statusLine = document.getElementById("status");
+
+function setStatus(text, cls) {
+  statusLine.textContent = text;
+  statusLine.className = cls || "";
+}
+
+async function loadInfo() {
+  const resp = await fetch("/info", {cache: "no-store"});
+  const info = await resp.json();
+  document.getElementById("version").textContent = `${info.version}, built ${info.built}`;
+  return info;
+}
+
+// the board reboots into the new firmware: wait until it answers again
+async function waitForReboot(started) {
+  for (let i = 0; i < 60; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    try {
+      const info = await loadInfo();
+      setStatus(`Done. Running firmware ${info.version}, built ${info.built}.`, "ok");
+      return;
+    } catch (e) {
+      setStatus(`Rebooting… ${Math.round((Date.now() - started) / 1000)} s`);
+    }
+  }
+  setStatus("The board did not come back. Check it is powered and on Wi-Fi.", "error");
+}
+
+function uploadFirmware() {
+  const files = document.getElementById("choose_firmware").files;
+  if (files.length == 0) {
+    alert("No file selected!");
+    return;
+  }
+  const input = document.getElementById("choose_firmware");
+  const button = document.getElementById("upload_firmware");
+  const progress = document.getElementById("progress");
+  input.disabled = true;
+  button.disabled = true;
+  progress.hidden = false;
+  progress.value = 0;
+
+  const xhttp = new XMLHttpRequest();
+  xhttp.upload.onprogress = (e) => {
+    if (e.lengthComputable) {
+      const percent = Math.round(100 * e.loaded / e.total);
+      progress.value = percent;
+      setStatus(`Uploading ${percent} % (${Math.round(e.loaded / 1024)} of ${Math.round(e.total / 1024)} KB)`);
+    }
+  };
+  xhttp.onload = () => {
+    if (xhttp.status == 200) {
+      progress.value = 100;
+      setStatus("Uploaded. Rebooting…");
+      waitForReboot(Date.now());
+    } else {
+      setStatus(`Error ${xhttp.status}: ${xhttp.responseText}`, "error");
+      input.disabled = false;
+      button.disabled = false;
+    }
+  };
+  xhttp.onerror = () => {
+    setStatus("The connection was closed. Try again.", "error");
+    input.disabled = false;
+    button.disabled = false;
+  };
+  xhttp.open("POST", "/upload_firmware", true);
+  xhttp.send(files[0]);
+}
+
+loadInfo().catch(() => {});
+</script>
+</body>
+</html>

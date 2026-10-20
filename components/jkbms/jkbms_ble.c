@@ -28,6 +28,7 @@
 #include "esp_gatt_common_api.h"
 #include "esp_gatt_defs.h"
 #include "nvs.h"
+#include <sys/param.h>
 
 
 #define JKBMS_SERVICE_UUID          0xFFE0
@@ -79,7 +80,7 @@ static bool m_scanning = false;
 static int m_connecting_idx = -1;
 static bool m_discovery = false;
 static bool m_fetch_extras = true;
-static bool m_reconnect_on_stall = true;
+static int64_t m_refresh_us = STREAM_STALL_US;   // 0: never reconnect for fresh data
 
 // device info survives deep sleep, so that it is requested once per power-on
 typedef struct {
@@ -723,8 +724,8 @@ static void jkbms_supervisor_task(void *args) {
                 slot_request_extras(slot, now);
                 // The BMS stops streaming about 30 s after connecting and ignores
                 // further requests; a fresh connection restarts the stream.
-                if (m_reconnect_on_stall && now - slot->st.cells_updated_us > STREAM_STALL_US) {
-                    ESP_LOGI(TAG, "[BMS %d] stream stalled, reconnecting", i + 1);
+                if (m_refresh_us > 0 && now - slot->st.cells_updated_us > MAX(m_refresh_us, STREAM_STALL_US)) {
+                    ESP_LOGI(TAG, "[BMS %d] reconnecting for fresh data", i + 1);
                     esp_ble_gap_disconnect(slot->st.mac);
                     slot_set_link(slot, JKBMS_LINK_CONNECTED);
                 }
@@ -802,8 +803,8 @@ bool jkbms_ble_get_status(int idx, jkbms_status_t *status) {
 }
 
 
-void jkbms_ble_set_reconnect_on_stall(bool enable) {
-    m_reconnect_on_stall = enable;
+void jkbms_ble_set_refresh_period_s(int period_s) {
+    m_refresh_us = period_s * 1000000LL;
 }
 
 

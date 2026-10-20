@@ -28,7 +28,7 @@
 #define LCD_GAP_X               52
 #define LCD_GAP_Y               40
 
-#define LCD_DRAW_BUF_LINES      24
+#define LCD_DRAW_BUF_LINES      12    // two DMA buffers of 3 KB: heap is tight
 
 static const char *TAG = "lcd";
 static esp_lcd_panel_handle_t m_panel = NULL;
@@ -39,28 +39,12 @@ void lcd_backlight(bool on) {
 }
 
 
-void lcd_sleep(void) {
-    lcd_backlight(false);
-    if (m_panel != NULL) {
-        // no LVGL flush may run on the SPI bus while the panel goes to sleep
-        lvgl_port_lock(0);
-        lvgl_port_stop();
-        lvgl_port_unlock();
-        vTaskDelay(pdMS_TO_TICKS(50));
-        esp_lcd_panel_disp_on_off(m_panel, false);
-        esp_lcd_panel_disp_sleep(m_panel, true);
-    }
-    gpio_hold_en(LCD_PIN_BL);
-    gpio_deep_sleep_hold_en();
-}
-
-
 lv_display_t* lcd_init(void) {
     const gpio_config_t bl_config = {
         .pin_bit_mask = 1ULL << LCD_PIN_BL,
         .mode = GPIO_MODE_OUTPUT,
     };
-    gpio_hold_dis(LCD_PIN_BL);  // held low during deep sleep
+    gpio_hold_dis(LCD_PIN_BL);  // older firmware held it low in deep sleep
     ESP_ERROR_CHECK(gpio_config(&bl_config));
     lcd_backlight(false);
 

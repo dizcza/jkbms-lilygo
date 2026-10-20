@@ -77,9 +77,7 @@ def main():
     screenshot(port, out_dir / "cells.png")
     command(port, "n")
     screenshot(port, out_dir / "pack.png")
-    command(port, "n")
-    screenshot(port, out_dir / "history.png")
-    command(port, "nn")                 # 7 days, cell 1
+    command(port, "n")                  # cell 1
     screenshot(port, out_dir / "cell.png")
     command(port, "n" * 8)              # cells 2..8, then errors
     screenshot(port, out_dir / "errors.png")
@@ -87,9 +85,6 @@ def main():
     screenshot(port, out_dir / "settings.png")
     command(port, "n" * 7)              # remaining settings pages, then the logbook
     screenshot(port, out_dir / "log.png")
-    command(port, "z")
-    screenshot(port, out_dir / "sleep.png")
-    command(port, "Z")
     command(port, "L", delay=7)         # long press: the list shows after a 5 s search
     screenshot(port, out_dir / "pick.png")
     command(port, "n", delay=0.3)       # select: connects behind the spinner

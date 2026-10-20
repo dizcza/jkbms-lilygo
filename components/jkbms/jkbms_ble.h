@@ -93,10 +93,11 @@ void jkbms_ble_set_discovery(bool enable);
 void jkbms_ble_set_fetch_extras(bool enable);
 
 /**
- * Whether to reconnect when the BMS stops streaming (default true). The BMS
- * stops about 30 s after connecting and beeps on every new connection.
+ * Reconnects when the data is older than `period_s` (default: as soon as
+ * the stream stops; 0: never). The BMS stops streaming about 30 s after
+ * connecting and beeps on every new connection.
  */
-void jkbms_ble_set_reconnect_on_stall(bool enable);
+void jkbms_ble_set_refresh_period_s(int period_s);
 
 /**
  * Lists JK BMS advertisers seen within max_age_us, strongest signal first.

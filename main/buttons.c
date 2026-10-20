@@ -72,5 +72,5 @@ void buttons_init(buttons_cb_t callback) {
     ESP_ERROR_CHECK(gpio_config(&config_left));
     ESP_ERROR_CHECK(gpio_config(&config_right));
     // the callback renders the UI, which needs a large stack
-    xTaskCreate(buttons_task, "buttons", 8192, (void*) callback, 5, NULL);
+    xTaskCreate(buttons_task, "buttons", 6144, (void*) callback, 5, NULL);
 }

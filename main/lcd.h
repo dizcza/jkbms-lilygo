@@ -20,12 +20,6 @@
 lv_display_t* lcd_init(void);
 void lcd_backlight(bool on);
 
-/**
- * Turns the backlight and the panel off and keeps the backlight pin low
- * during deep sleep.
- */
-void lcd_sleep(void);
-
 #ifdef __cplusplus
 }
 #endif

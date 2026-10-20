@@ -11,41 +11,43 @@ The BLE protocol is ported from [esphome-jk-bms](https://github.com/syssi/esphom
 Left button: previous page. Right button: next page. Hold left for 1.5 s to pick
 another BMS.
 
-| Summary | All cells | Pack | History |
-|:---:|:---:|:---:|:---:|
-| ![summary](docs/screenshots/summary.png) | ![cells](docs/screenshots/cells.png) | ![pack](docs/screenshots/pack.png) | ![history](docs/screenshots/history.png) |
-| Pack voltage, current, power, state of charge, the largest cell voltage difference, charge / discharge / balancer state | Voltage of every cell, highest in red, lowest in blue | Temperatures, charge cycles, balancing current | SOC and the lowest cell voltage over the last 24 h and 7 days, from the readings stored on the board |
+| Summary | All cells | Pack |
+|:---:|:---:|:---:|
+| ![summary](docs/screenshots/summary.png) | ![cells](docs/screenshots/cells.png) | ![pack](docs/screenshots/pack.png) |
+| Pack voltage, current, power, state of charge, the largest cell voltage difference, charge / discharge / balancer state | Voltage of every cell, highest in red, lowest in blue | Temperatures, charge cycles, balancing current |
 
 | Cell | Errors | Settings | Log |
 |:---:|:---:|:---:|:---:|
 | ![cell](docs/screenshots/cell.png) | ![errors](docs/screenshots/errors.png) | ![settings](docs/screenshots/settings.png) | ![log](docs/screenshots/log.png) |
 | Voltage and resistance of one cell, the selected cell in the bar chart | Active BMS alarms (empty when there are none) | BMS settings: switches, protection voltages, currents, temperatures | The last 50 events of the BMS logbook, newest first |
 
-| Sleep | Pick BMS | Connecting | No BMS |
-|:---:|:---:|:---:|:---:|
-| ![sleep](docs/screenshots/sleep.png) | ![pick](docs/screenshots/pick.png) | ![connecting](docs/screenshots/connecting.png) | ![no bms](docs/screenshots/no_bms.png) |
-| Shown for 2 s before deep sleep; a button press cancels it | Shown when several BMS are around or after holding the left button | While searching and connecting; errors appear below the spinner | No BMS found: it is off, away, or the JK app on a phone is connected to it |
+| Pick BMS | Connecting | No BMS |
+|:---:|:---:|:---:|
+| ![pick](docs/screenshots/pick.png) | ![connecting](docs/screenshots/connecting.png) | ![no bms](docs/screenshots/no_bms.png) |
+| Shown when several BMS are around or after holding the left button | While searching and connecting; errors appear below the spinner | No BMS found: it is off, away, or the JK app on a phone is connected to it |
 
-The header turns red and blinks while a BMS reports an active error.
+The last page, **Board**, shows the firmware version, the Wi-Fi network and the address of the
+firmware update page. Without a BMS it is one right-button press away from the NO BMS screen.
 
-When the board wakes up on a button press and the battery went below 2 % or the BMS reported
-an alarm since the last look, an alert page opens first: when the battery went low, the
-average current in the 3 hours before, the lowest cell and when, when discharging was switched
-off, and each alarm with its time. Any button dismisses it.
+The header turns red and blinks while a BMS reports an active error. The Wi-Fi icon in the
+header is crossed out in red while the board is offline.
 
 ## How it works
 
 - **Picking a BMS.** At the first boot the board searches for JK BMS advertisements. A single
   BMS is selected automatically, several are listed. The choice is saved to flash.
-- **Reading.** The BMS is connected once per wakeup and read: the BMS beeps on every command,
-  so the firmware sends as few as possible.
-- **Sleep.** After 30 s without a button press the board goes to deep sleep. Either button
-  wakes it up.
-- **History.** Every reading is also stored in a 1 MB flash partition (about 3 weeks at one
-  reading a minute), so a drained battery can be inspected without Wi-Fi.
-- **Upload.** Every 60 s the board wakes up with the display off, reads the BMS, POSTs the
-  status as JSON over Wi-Fi and goes back to sleep. The settings and the logbook are sent
-  with every 10th upload.
+- **Always on.** The display stays on and Wi-Fi stays connected; the board is meant to be
+  powered from USB.
+- **Reading.** The BMS stops streaming about 30 s after connecting, so it is reconnected once a
+  minute for fresh data. It beeps on every command, so the firmware sends as few as possible.
+- **Upload.** The status is POSTed as JSON over Wi-Fi as soon as the BMS streams after each
+  (re)connection, about once a minute. The first upload after power-on carries the settings
+  and the whole logbook; later ones carry new logbook events, and the settings every 10th time.
+  Without a BMS the board still reports every 2 minutes, so the dashboard shows it offline.
+- **Firmware update.** Open http://espbms.local/ (mDNS) or http://&lt;board IP&gt;/ from the same
+  network, choose `build/jkbms.bin` and press Upload; a progress bar shows on the page and on
+  the display. The new firmware goes to the other of two OTA slots. If it does not get back on
+  Wi-Fi after the reboot, the next reset rolls back to the previous firmware.
 
 ## Dashboard
 
@@ -60,6 +62,9 @@ ESP-IDF 5.5, target `esp32`:
 ```sh
 idf.py build flash monitor
 ```
+
+The first flash goes over USB (it writes the bootloader and the partition table with the two
+OTA slots); later updates can use the web page.
 
 Secrets are not part of this repository. `main/CMakeLists.txt` reads them from
 `../secrets/jkbms/firmware.env` (environment variables with the same names take precedence):

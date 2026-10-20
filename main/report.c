@@ -6,13 +6,15 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "cJSON.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "jkbms_ble.h"
 
-#define FRESH_US   (15 * 1000000LL)
+// the BMS is read once per upload period: data of the last read counts as online
+#define FRESH_US   ((CONFIG_UPLOAD_PERIOD_S + 30) * 1000000LL)
 
 
 // floats would otherwise be printed as 3.3340001106262207
@@ -108,12 +110,31 @@ static void add_settings(cJSON *bms, const jkbms_settings_t *s) {
 }
 
 
-static void add_logbook(cJSON *bms, const jkbms_status_t *st) {
+// logbook totals of the last delivered report and of the one being sent
+static uint32_t m_logbook_sent[JKBMS_DEVICES_MAX];
+static uint32_t m_logbook_pending[JKBMS_DEVICES_MAX];
+
+
+/**
+ * Adds the newest logbook events that were not delivered yet (the dashboard
+ * keeps the older ones), oldest first.
+ */
+static void add_logbook(cJSON *bms, int slot, const jkbms_status_t *st) {
+    // the last entry is event number `total`
+    const uint32_t sent = m_logbook_sent[slot];
+    int first = 0;
+    if (sent <= st->logbook_total && st->logbook_total - sent < st->logbook_count) {
+        first = st->logbook_count - (st->logbook_total - sent);
+    }
+    m_logbook_pending[slot] = st->logbook_total;
+    if (first >= st->logbook_count) {
+        return;  // nothing new
+    }
     cJSON *o = cJSON_AddObjectToObject(bms, "logbook");
     add_number(o, "total", st->logbook_total);
     add_number(o, "uptime", jkbms_bms_now_s(st));
     cJSON *events = cJSON_AddArrayToObject(o, "events");
-    for (int i = 0; i < st->logbook_count; i++) {
+    for (int i = first; i < st->logbook_count; i++) {
         char label[64];
         jkbms_log_label(st->logbook[i].code, label, sizeof(label));
         cJSON *event = cJSON_CreateArray();
@@ -165,8 +186,8 @@ char* report_build(uint32_t wake, bool with_extras) {
         if (with_extras && st.settings_valid) {
             add_settings(bms, &st.settings);
         }
-        if (with_extras && st.logbook_valid && st.info_valid) {
-            add_logbook(bms, &st);
+        if (st.logbook_valid && st.info_valid) {
+            add_logbook(bms, i, &st);
         }
         cJSON_AddItemToArray(list, bms);
     }
@@ -174,4 +195,9 @@ char* report_build(uint32_t wake, bool with_extras) {
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     return json;
+}
+
+
+void report_mark_sent(void) {
+    memcpy(m_logbook_sent, m_logbook_pending, sizeof(m_logbook_sent));
 }

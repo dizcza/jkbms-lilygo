@@ -1,21 +1,13 @@
 menu "JK BMS monitor UI"
 
-    config UI_SLEEP_IDLE_S
-        int "Deep sleep after N seconds without a button press (0 = never)"
-        range 0 3600
-        default 30
-        help
-            Counted from the last button press or from the moment the BMS data
-            appears. Either button wakes the board up. The picker never sleeps.
-
     config UI_SCREENSHOT_CONSOLE
         bool "Serial console to drive the UI and take screenshots (development)"
         default n
         select LV_USE_SNAPSHOT
         help
             Single-character commands on the console UART: n/p = right/left
-            button, L = long left press, z/Z = show/hide the sleep screen,
-            a = made-up BMS names and MACs, s = dump the screen as hex RGB565.
+            button, L = long left press, a = made-up BMS names and MACs,
+            s = dump the screen as hex RGB565.
             Used by tools/screenshots.py.
 
     config UI_AUTO_SELECT_S
@@ -28,17 +20,18 @@ endmenu
 menu "JK BMS status upload"
 
     config UPLOAD_PERIOD_S
-        int "Wake up from deep sleep and upload the status every N seconds (0 = never)"
+        int "Read the BMS and upload the status every N seconds (0 = never)"
         range 0 86400
         default 60
         help
-            Timer wakeups keep the display off: they read the BMS, POST the
-            status over Wi-Fi and go back to sleep. The endpoint URL, the API
-            token and the Wi-Fi networks are build-time secrets, see
-            main/CMakeLists.txt.
+            The BMS is reconnected about once per period for fresh data (it
+            beeps on every connection) and the status is POSTed over Wi-Fi
+            as soon as the new data streams in. The
+            endpoint URL, the API token and the Wi-Fi networks are build-time
+            secrets, see main/CMakeLists.txt.
 
     config UPLOAD_EXTRAS_EVERY
-        int "Include the BMS settings and logbook every N uploads"
+        int "Include the BMS settings and re-read the logbook every N uploads"
         range 1 1000
         default 10
 
