@@ -1,0 +1,8 @@
+menu "JK BMS monitor UI"
+
+    config UI_AUTO_SELECT_S
+        int "Auto-select the only BMS found after N seconds"
+        range 1 60
+        default 5
+
+endmenu

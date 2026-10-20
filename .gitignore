@@ -1,0 +1,17 @@
+.vscode/
+.cproject
+.project
+.cache/
+.idea/
+build/
+ignored/
+sdkconfig.old
+sdkconfig
+*.component_hash
+managed_components/
+.clangd
+secret/
+.clang-format
+secrets/
+dependencies.lock
+.settings/

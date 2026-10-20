@@ -1,0 +1,38 @@
+menu "JK BMS BLE"
+
+    config JKBMS_NUM_DEVICES
+        int "Number of JK BMS devices to monitor"
+        range 1 3
+        default 2
+
+    config JKBMS_MAC_1
+        string "BMS 1 MAC address"
+        default ""
+        help
+            MAC address of the first BMS, e.g. "C8:47:8C:12:34:56".
+            Leave empty to pick it on the screen; the pick is saved to NVS.
+            Hold both buttons for 2 s to forget it and pick again.
+
+    config JKBMS_MAC_2
+        string "BMS 2 MAC address"
+        default ""
+        depends on JKBMS_NUM_DEVICES >= 2
+        help
+            MAC address of the second BMS. Leave empty to pick it on the screen.
+
+    config JKBMS_MAC_3
+        string "BMS 3 MAC address"
+        default ""
+        depends on JKBMS_NUM_DEVICES >= 3
+        help
+            MAC address of the third BMS. Leave empty to pick it on the screen.
+
+    config JKBMS_NAME_PREFIX
+        string "Advertised name prefix of JK BMS"
+        default "JK"
+        help
+            A device whose advertised name starts with this prefix, or which
+            advertises the 0xFFE0 service or JK manufacturer data (0x0B65),
+            is treated as a JK BMS candidate.
+
+endmenu
