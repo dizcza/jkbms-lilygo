@@ -21,10 +21,10 @@ another BMS.
 | ![cell](docs/screenshots/cell.png) | ![errors](docs/screenshots/errors.png) | ![settings](docs/screenshots/settings.png) | ![log](docs/screenshots/log.png) |
 | Voltage and resistance of one cell, the selected cell in the bar chart | Active BMS alarms (empty when there are none) | BMS settings: switches, protection voltages, currents, temperatures | The last 50 events of the BMS logbook, newest first |
 
-| Sleep | Pick BMS | Connecting |
-|:---:|:---:|:---:|
-| ![sleep](docs/screenshots/sleep.png) | ![pick](docs/screenshots/pick.png) | ![connecting](docs/screenshots/connecting.png) |
-| Shown for 2 s before deep sleep; a button press cancels it | Shown when several BMS are around or after holding the left button | While searching and connecting; errors appear below the spinner |
+| Sleep | Pick BMS | Connecting | No BMS |
+|:---:|:---:|:---:|:---:|
+| ![sleep](docs/screenshots/sleep.png) | ![pick](docs/screenshots/pick.png) | ![connecting](docs/screenshots/connecting.png) | ![no bms](docs/screenshots/no_bms.png) |
+| Shown for 2 s before deep sleep; a button press cancels it | Shown when several BMS are around or after holding the left button | While searching and connecting; errors appear below the spinner | No BMS found: it is off, away, or the JK app on a phone is connected to it |
 
 The header turns red and blinks while a BMS reports an active error.
 

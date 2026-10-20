@@ -256,6 +256,7 @@ static struct {
     bool picker_touched;
     bool picker_manual;      // opened by the user: always show the list
     int64_t picker_start_us;
+    lv_obj_t *no_bms;        // full-screen "no BMS" image
     // deep sleep
     lv_obj_t *sleep_screen;
     bool anonymize;          // screenshots: show made-up BMS names and MACs
@@ -465,6 +466,54 @@ static void create_nodata_page(lv_obj_t *scr) {
 }
 
 
+/**
+ * Full-screen sad page (folded sheet, crossed eyes, frown) with "NO BMS" below,
+ * shown when no BMS is found. Drawn with LVGL lines and an arc.
+ */
+static void create_no_bms(lv_obj_t *scr) {
+    lv_obj_t *cont = make_container(scr, 0, LCD_V_RES);
+    lv_obj_set_style_bg_color(cont, lv_color_hex(COLOR_BG), 0);
+    lv_obj_set_style_bg_opa(cont, LV_OPA_COVER, 0);
+
+    static const lv_point_precise_t sheet[] = {
+        { 27, 40 }, { 85, 40 }, { 107, 62 }, { 107, 146 }, { 27, 146 }, { 27, 40 },
+    };
+    static const lv_point_precise_t fold[] = { { 85, 40 }, { 85, 62 }, { 107, 62 } };
+    static const lv_point_precise_t eyes[][2] = {
+        { { 45, 75 }, { 57, 87 } }, { { 57, 75 }, { 45, 87 } },
+        { { 77, 75 }, { 89, 87 } }, { { 89, 75 }, { 77, 87 } },
+    };
+    const struct { const lv_point_precise_t *points; int count; } lines[] = {
+        { sheet, 6 }, { fold, 3 },
+        { eyes[0], 2 }, { eyes[1], 2 }, { eyes[2], 2 }, { eyes[3], 2 },
+    };
+    for (int i = 0; i < 6; i++) {
+        lv_obj_t *line = lv_line_create(cont);
+        lv_line_set_points(line, lines[i].points, lines[i].count);
+        lv_obj_set_style_line_width(line, 5, 0);
+        lv_obj_set_style_line_color(line, lv_color_hex(COLOR_TEXT), 0);
+        lv_obj_set_style_line_rounded(line, true, 0);
+    }
+
+    // the frown: the top of a circle centred below the mouth
+    lv_obj_t *mouth = lv_arc_create(cont);
+    lv_obj_set_size(mouth, 44, 44);
+    lv_obj_set_pos(mouth, 67 - 22, 106);
+    lv_arc_set_bg_angles(mouth, 225, 315);
+    lv_obj_remove_style(mouth, NULL, LV_PART_KNOB);
+    lv_obj_set_style_arc_opa(mouth, LV_OPA_TRANSP, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(mouth, 5, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(mouth, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(mouth, true, LV_PART_MAIN);
+    lv_obj_remove_flag(mouth, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *label = make_label(cont, &lv_font_montserrat_28, COLOR_TEXT, 0, 0);
+    lv_label_set_text(label, "NO BMS");
+    lv_obj_align(label, LV_ALIGN_TOP_MID, 0, 166);
+    m_ui.no_bms = cont;
+}
+
+
 static void create_chart(lv_obj_t *scr) {
     m_ui.chart = make_container(scr, CHART_Y, CHART_H);
     lv_obj_set_x(m_ui.chart, CHART_X);
@@ -493,6 +542,7 @@ static void hide_pages(void) {
     set_visible(m_ui.nodata.cont, false);
     set_visible(m_ui.picker.cont, false);
     set_visible(m_ui.chart, false);
+    set_visible(m_ui.no_bms, false);
 }
 
 
@@ -529,6 +579,7 @@ void ui_init(lv_display_t *disp) {
     create_nodata_page(scr);
     create_picker_page(scr);
     create_chart(scr);
+    create_no_bms(scr);
     hide_pages();
 
     ui_fetch_status();
@@ -1051,10 +1102,9 @@ static void update_nodata(const jkbms_status_t *st) {
         break;
     case JKBMS_ERROR_NOT_FOUND:
         // the saved BMS is off or away: not an error
-        message = "BMS not found";
-        hint = "Is it on? Close the JK app on the phone. " HINT_PICK_ANOTHER;
-        error = false;
-        break;
+        set_visible(m_ui.header, false);
+        set_visible(m_ui.no_bms, true);
+        return;
     case JKBMS_ERROR_CONNECT:
         message = "Connection failed";
         hint = "Retrying. " HINT_PICK_ANOTHER;
@@ -1629,8 +1679,8 @@ static void picker_render(void) {
     } else if (picker_scanning()) {
         show_waiting(p->spinner, p->message, p->message_hint, "", "", false);
     } else {
-        show_waiting(p->spinner, p->message, p->message_hint, "No JK BMS found",
-                     "Turn the BMS on and close the JK app on the phone.", false);
+        set_visible(m_ui.header, false);
+        set_visible(m_ui.no_bms, true);
     }
 
     if (m_ui.cursor >= items) {
