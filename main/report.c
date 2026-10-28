@@ -6,12 +6,15 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/param.h>
 
 #include "cJSON.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "jkbms_ble.h"
+#include "remote.h"
 
 // the BMS is read once per upload period: data of the last read counts as online
 #define FRESH_US   ((CONFIG_UPLOAD_PERIOD_S + 30) * 1000000LL)
@@ -110,43 +113,18 @@ static void add_settings(cJSON *bms, const jkbms_settings_t *s) {
 }
 
 
-// logbook totals of the last delivered report and of the one being sent
+#define LOGBOOK_CHUNK   10   // events per report: a whole logbook does not fit in memory at once
+
+// logbook event numbers: the last delivered and the last in the report being sent
 static uint32_t m_logbook_sent[JKBMS_DEVICES_MAX];
 static uint32_t m_logbook_pending[JKBMS_DEVICES_MAX];
 
 
 /**
- * Adds the newest logbook events that were not delivered yet (the dashboard
- * keeps the older ones), oldest first.
+ * A report with the board ID and one entry per assigned BMS (slot and MAC);
+ * `part` names a partial report ("settings", "logbook"), NULL for the status.
  */
-static void add_logbook(cJSON *bms, int slot, const jkbms_status_t *st) {
-    // the last entry is event number `total`
-    const uint32_t sent = m_logbook_sent[slot];
-    int first = 0;
-    if (sent <= st->logbook_total && st->logbook_total - sent < st->logbook_count) {
-        first = st->logbook_count - (st->logbook_total - sent);
-    }
-    m_logbook_pending[slot] = st->logbook_total;
-    if (first >= st->logbook_count) {
-        return;  // nothing new
-    }
-    cJSON *o = cJSON_AddObjectToObject(bms, "logbook");
-    add_number(o, "total", st->logbook_total);
-    add_number(o, "uptime", jkbms_bms_now_s(st));
-    cJSON *events = cJSON_AddArrayToObject(o, "events");
-    for (int i = first; i < st->logbook_count; i++) {
-        char label[64];
-        jkbms_log_label(st->logbook[i].code, label, sizeof(label));
-        cJSON *event = cJSON_CreateArray();
-        cJSON_AddItemToArray(event, cJSON_CreateNumber(st->logbook[i].timestamp_s));
-        cJSON_AddItemToArray(event, cJSON_CreateNumber(st->logbook[i].code));
-        cJSON_AddItemToArray(event, cJSON_CreateString(label));
-        cJSON_AddItemToArray(events, event);
-    }
-}
-
-
-char* report_build(uint32_t wake, bool with_extras) {
+static cJSON* report_start(const char *part, uint32_t wake) {
     cJSON *root = cJSON_CreateObject();
     uint8_t mac[6];
     esp_efuse_mac_get_default(mac);
@@ -154,19 +132,41 @@ char* report_build(uint32_t wake, bool with_extras) {
     snprintf(device, sizeof(device), "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     cJSON_AddStringToObject(root, "device", device);
     add_number(root, "wake", wake);
-    cJSON *list = cJSON_AddArrayToObject(root, "bms");
+    if (part != NULL) {
+        cJSON_AddStringToObject(root, "part", part);
+    }
+    cJSON_AddArrayToObject(root, "bms");
+    return root;
+}
 
+
+static cJSON* report_add_bms(cJSON *root, int slot, const jkbms_status_t *st) {
+    cJSON *bms = cJSON_CreateObject();
+    char mac_str[18];
+    snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X", st->mac[0], st->mac[1], st->mac[2],
+             st->mac[3], st->mac[4], st->mac[5]);
+    add_number(bms, "slot", slot + 1);
+    cJSON_AddStringToObject(bms, "mac", mac_str);
+    cJSON_AddItemToArray(cJSON_GetObjectItem(root, "bms"), bms);
+    return bms;
+}
+
+
+static char* report_finish(cJSON *root) {
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return json;
+}
+
+
+char* report_build(uint32_t wake) {
+    cJSON *root = report_start(NULL, wake);
     static jkbms_status_t st;  // large: keep it off the stack
     for (int i = 0; i < JKBMS_DEVICES_MAX; i++) {
         if (!jkbms_ble_get_status(i, &st) || st.link == JKBMS_LINK_UNASSIGNED) {
             continue;
         }
-        cJSON *bms = cJSON_CreateObject();
-        char mac_str[18];
-        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X", st.mac[0], st.mac[1], st.mac[2],
-                 st.mac[3], st.mac[4], st.mac[5]);
-        add_number(bms, "slot", i + 1);
-        cJSON_AddStringToObject(bms, "mac", mac_str);
+        cJSON *bms = report_add_bms(root, i, &st);
         const bool online = st.cells_valid && esp_timer_get_time() - st.cells_updated_us < FRESH_US;
         cJSON_AddBoolToObject(bms, "online", online);
         if (online) {
@@ -183,23 +183,74 @@ char* report_build(uint32_t wake, bool with_extras) {
         if (online) {
             add_cells(bms, &st.cells);
         }
-        if (with_extras && st.settings_valid) {
-            add_settings(bms, &st.settings);
-        }
-        if (st.logbook_valid && st.info_valid) {
-            add_logbook(bms, i, &st);
-        }
-        cJSON_AddItemToArray(list, bms);
     }
-
-    char *json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    return json;
+    remote_add_diag(root);
+    return report_finish(root);
 }
 
 
-void report_mark_sent(void) {
-    memcpy(m_logbook_sent, m_logbook_pending, sizeof(m_logbook_sent));
+char* report_build_settings(int slot, const jkbms_settings_t *settings) {
+    static jkbms_status_t st;
+    if (!jkbms_ble_get_status(slot, &st) || st.link == JKBMS_LINK_UNASSIGNED) {
+        return NULL;
+    }
+    cJSON *root = report_start("settings", 0);
+    add_settings(report_add_bms(root, slot, &st), settings);
+    return report_finish(root);
+}
+
+
+char* report_build_logbook(int slot, const jkbms_extras_t *x) {
+    static jkbms_status_t st;
+    if (!x->logbook_valid || !jkbms_ble_get_status(slot, &st) || st.link == JKBMS_LINK_UNASSIGNED) {
+        return NULL;
+    }
+    // the last entry is event number `logbook_total`
+    const uint32_t sent = m_logbook_sent[slot];
+    int first = 0;
+    if (sent <= x->logbook_total && x->logbook_total - sent < x->logbook_count) {
+        first = x->logbook_count - (x->logbook_total - sent);
+    }
+    if (first >= x->logbook_count) {
+        return NULL;  // nothing new
+    }
+    const int end = MIN(x->logbook_count, first + LOGBOOK_CHUNK);
+    // "total" is the number of the last event in the list
+    const uint32_t last = x->logbook_total - (x->logbook_count - end);
+    m_logbook_pending[slot] = last;
+
+    cJSON *root = report_start("logbook", 0);
+    cJSON *o = cJSON_AddObjectToObject(report_add_bms(root, slot, &st), "logbook");
+    add_number(o, "total", last);
+    // the BMS uptime now: the events may be sent long after they were read
+    add_number(o, "uptime", x->logbook_uptime_s + (esp_timer_get_time() - x->logbook_read_us) / 1000000);
+    cJSON *events = cJSON_AddArrayToObject(o, "events");
+    for (int i = first; i < end; i++) {
+        char label[64];
+        jkbms_log_label(x->logbook[i].code, label, sizeof(label));
+        cJSON *event = cJSON_CreateArray();
+        cJSON_AddItemToArray(event, cJSON_CreateNumber(x->logbook[i].timestamp_s));
+        cJSON_AddItemToArray(event, cJSON_CreateNumber(x->logbook[i].code));
+        cJSON_AddItemToArray(event, cJSON_CreateString(label));
+        cJSON_AddItemToArray(events, event);
+    }
+    return report_finish(root);
+}
+
+
+char* report_add_age(const char *json, uint32_t age_s) {
+    // {"device":... -> {"age":N,"device":...
+    const size_t len = strlen(json) + 24;
+    char *aged = malloc(len);
+    if (aged != NULL) {
+        snprintf(aged, len, "{\"age\":%lu,%s", (unsigned long) age_s, json + 1);
+    }
+    return aged;
+}
+
+
+void report_logbook_sent(int slot) {
+    m_logbook_sent[slot] = m_logbook_pending[slot];
 }
 
 

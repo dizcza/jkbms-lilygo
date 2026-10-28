@@ -51,13 +51,25 @@ typedef struct {
     bool cells_valid;
     jkbms_cell_info_t cells;
     int64_t cells_updated_us;    // esp_timer_get_time() of the last cell info frame
+} jkbms_status_t;
+
+
+/**
+ * The settings and the logbook, read on demand into a buffer of the caller
+ * (memory is short: nothing keeps them), see jkbms_ble_fetch_extras().
+ */
+typedef struct {
+    bool want_settings;          // set by the caller, cleared when the settings arrived
+    bool want_logbook;
     bool settings_valid;
     jkbms_settings_t settings;
     bool logbook_valid;
     uint32_t logbook_total;      // number of events stored in the BMS
     uint8_t logbook_count;       // number of events in `logbook`, oldest first
+    uint32_t logbook_uptime_s;   // BMS uptime when the logbook was read, the time base of its events
+    int64_t logbook_read_us;     // esp_timer_get_time() then
     jkbms_log_entry_t logbook[JKBMS_LOGBOOK_FRAME_ENTRIES];
-} jkbms_status_t;
+} jkbms_extras_t;
 
 
 typedef struct {
@@ -66,6 +78,17 @@ typedef struct {
     int rssi;
     int64_t seen_us;
 } jkbms_found_t;
+
+
+typedef struct {
+    uint8_t mac[6];
+    char name[24];
+    int rssi;
+    uint8_t addr_type;
+    bool jk;                     // recognized as a JK BMS
+    uint32_t count;              // advertisements received
+    int64_t seen_us;
+} jkbms_seen_t;
 
 
 /**
@@ -80,17 +103,17 @@ esp_err_t jkbms_ble_init(void);
 bool jkbms_ble_get_status(int idx, jkbms_status_t *status);
 
 /**
+ * Disconnects the BMS and turns Bluetooth off for good, freeing its memory
+ * and radio time for a firmware update. Only a restart turns it on again.
+ */
+void jkbms_ble_shutdown(void);
+
+/**
  * Keeps scanning for JK BMS advertisers even when all assigned devices
  * are connected, so that jkbms_ble_get_found() stays up to date.
  */
 void jkbms_ble_set_discovery(bool enable);
 
-/**
- * Whether to request the settings and the logbook once the data stream
- * starts (default true). The logbook is still fetched when requested with
- * jkbms_ble_request_logbook().
- */
-void jkbms_ble_set_fetch_extras(bool enable);
 
 /**
  * Reconnects when the data is older than `period_s` (default: as soon as
@@ -105,15 +128,36 @@ void jkbms_ble_set_refresh_period_s(int period_s);
 int jkbms_ble_get_found(jkbms_found_t *list, int max, int64_t max_age_us);
 
 /**
- * Asks the BMS for its event logbook on the next data exchange.
+ * Reads the settings and/or the logbook (want_settings, want_logbook) of a
+ * BMS into `extras`, which must stay valid until both arrived (the want_
+ * flags are cleared, the _valid flags set) or jkbms_ble_cancel_extras().
+ * Each is requested once per connection while the BMS streams; it beeps on
+ * every request. False when two other requests are pending already.
  */
-void jkbms_ble_request_logbook(int idx);
+bool jkbms_ble_fetch_extras(int idx, jkbms_extras_t *extras);
+
+/**
+ * Forgets a request of jkbms_ble_fetch_extras(): `extras` can be freed then.
+ */
+void jkbms_ble_cancel_extras(jkbms_extras_t *extras);
 
 /**
  * Assigns a MAC address to an unassigned slot, saves it to NVS so that it is
  * restored on the next boot, and starts connecting to it.
  */
 bool jkbms_ble_assign(int idx, const uint8_t mac[6]);
+
+/**
+ * Replaces the BMS of a slot, whether assigned or not, and saves the choice.
+ * A NULL or all-zero MAC unassigns the slot.
+ */
+bool jkbms_ble_set_mac(int idx, const uint8_t mac[6]);
+
+/**
+ * Lists every BLE advertiser seen within max_age_us (JK BMS or not),
+ * strongest signal first. For diagnostics.
+ */
+int jkbms_ble_get_seen(jkbms_seen_t *list, int max, int64_t max_age_us);
 
 /**
  * Erases the BMS selection saved by jkbms_ble_assign().

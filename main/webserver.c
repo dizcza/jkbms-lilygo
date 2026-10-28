@@ -22,15 +22,18 @@
 #include "esp_system.h"
 #include "mdns.h"
 
+#include "jkbms_ble.h"
 #include "ui.h"
 
 #define SCRATCH_SIZE    4096
-#define HEADER_SIZE     (sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t))
+#define RECV_TIMEOUTS   3       // of config.recv_wait_timeout each: a stalled upload gives up
+#define HEADER_SIZE     WEBSERVER_IMAGE_HEADER_SIZE
 
 extern const char *const build_time;   // generated, see main/build_time.cmake
 
 static const char *TAG = "web";
-static volatile bool m_ota_active;
+static bool m_ota_active;               // a firmware is being written, from here or by remote.c
+static portMUX_TYPE m_ota_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile size_t m_ota_received;  // bytes written so far, for /progress
 static volatile size_t m_ota_total;
 
@@ -58,10 +61,7 @@ static esp_err_t info_handler(httpd_req_t *req) {
 }
 
 
-/**
- * Rejects anything but an app image for this chip.
- */
-static const char* check_header(const char *data) {
+const char* webserver_check_image(const char *data) {
     const esp_image_header_t *header = (const esp_image_header_t*) data;
     if (header->magic != ESP_IMAGE_HEADER_MAGIC) {
         return "Not an ESP firmware image";
@@ -106,15 +106,13 @@ static esp_err_t progress_handler(httpd_req_t *req) {
 static void ota_receive(httpd_req_t *req) {
     static char scratch[SCRATCH_SIZE];  // one upload at a time, see upload_firmware_handler()
     const esp_partition_t *partition = esp_ota_get_next_update_partition(NULL);
-    if (partition == NULL) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No OTA partition");
+    if (partition == NULL || req->content_len < HEADER_SIZE || req->content_len > partition->size) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, partition == NULL ? "No OTA partition" : "Wrong firmware size");
+        xTaskCreate(restart_task, "restart", 2048, NULL, 5, NULL);
         return;
     }
-    if (req->content_len < HEADER_SIZE || req->content_len > partition->size) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Wrong firmware size");
-        return;
-    }
-    ESP_LOGI(TAG, "Receiving %u bytes into %s", (unsigned) req->content_len, partition->label);
+    ESP_LOGI(TAG, "Receiving %u bytes into %s, %u bytes free", (unsigned) req->content_len, partition->label,
+             (unsigned) esp_get_free_heap_size());
     m_ota_received = 0;
     m_ota_total = req->content_len;
 
@@ -122,26 +120,28 @@ static void ota_receive(httpd_req_t *req) {
     size_t received = 0;
     size_t header_len = 0;       // the first chunk is collected until the header is complete
     int shown = -1;
+    int timeouts = 0;
     esp_err_t err = ESP_OK;
     const char *error = NULL;
     while (received < req->content_len) {
         const size_t offset = (handle == 0) ? header_len : 0;
         const size_t want = (handle == 0) ? HEADER_SIZE - header_len : SCRATCH_SIZE;
         const int len = httpd_req_recv(req, scratch + offset, MIN(want, req->content_len - received));
-        if (len == HTTPD_SOCK_ERR_TIMEOUT) {
+        if (len == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < RECV_TIMEOUTS) {
             continue;
         }
         if (len <= 0) {
             error = "File reception failed";
             break;
         }
+        timeouts = 0;
         received += len;
         if (handle == 0) {
             header_len += len;
             if (header_len < HEADER_SIZE) {
                 continue;
             }
-            error = check_header(scratch);
+            error = webserver_check_image(scratch);
             if (error != NULL) {
                 break;
             }
@@ -182,9 +182,13 @@ static void ota_receive(httpd_req_t *req) {
         esp_ota_abort(handle);
     }
     if (error != NULL) {
-        ESP_LOGW(TAG, "Firmware update failed: %s (%s)", error, esp_err_to_name(err));
+        ESP_LOGW(TAG, "Firmware update failed after %u of %u bytes: %s (%s), %u bytes free", (unsigned) received,
+                 (unsigned) req->content_len, error, esp_err_to_name(err), (unsigned) esp_get_free_heap_size());
         ui_ota_progress(-1);
+        httpd_resp_set_hdr(req, "Connection", "close");
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, error);
+        // Bluetooth is off: a restart brings the monitor back
+        xTaskCreate(restart_task, "restart", 2048, NULL, 5, NULL);
         return;
     }
 
@@ -198,7 +202,7 @@ static void ota_receive(httpd_req_t *req) {
 static void ota_task(void *args) {
     httpd_req_t *req = args;
     ota_receive(req);
-    m_ota_active = false;
+    webserver_ota_release();
     httpd_req_async_handler_complete(req);
     vTaskDelete(NULL);
 }
@@ -209,21 +213,22 @@ static void ota_task(void *args) {
  * /progress meanwhile.
  */
 static esp_err_t upload_firmware_handler(httpd_req_t *req) {
-    if (m_ota_active) {
+    if (!webserver_ota_claim()) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Another firmware update is running");
     }
     httpd_req_t *async = NULL;
     esp_err_t err = httpd_req_async_handler_begin(req, &async);
     if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        esp_restart();
+        return ESP_OK;
     }
-    m_ota_active = true;
     m_ota_received = 0;
     m_ota_total = 0;
-    if (xTaskCreate(ota_task, "ota", 6144, async, 5, NULL) != pdPASS) {
-        m_ota_active = false;
+    if (xTaskCreate(ota_task, "ota", 5120, async, 5, NULL) != pdPASS) {
         httpd_resp_send_err(async, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
         httpd_req_async_handler_complete(async);
+        esp_restart();
     }
     return ESP_OK;
 }
@@ -234,6 +239,25 @@ bool webserver_ota_active(void) {
 }
 
 
+bool webserver_ota_claim(void) {
+    taskENTER_CRITICAL(&m_ota_mux);
+    const bool claimed = !m_ota_active;
+    m_ota_active = true;
+    taskEXIT_CRITICAL(&m_ota_mux);
+    if (claimed) {
+        // Bluetooth takes memory and radio time the update needs; the board
+        // restarts after the update, whether it worked or not
+        jkbms_ble_shutdown();
+    }
+    return claimed;
+}
+
+
+void webserver_ota_release(void) {
+    m_ota_active = false;
+}
+
+
 esp_err_t webserver_start(void) {
     static httpd_handle_t server = NULL;
     if (server != NULL) {
@@ -241,6 +265,8 @@ esp_err_t webserver_start(void) {
     }
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.recv_wait_timeout = 10;
+    config.max_open_sockets = 4;    // heap is short
+    config.lru_purge_enable = true;
     esp_err_t err = httpd_start(&server, &config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start: %s", esp_err_to_name(err));

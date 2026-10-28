@@ -1,84 +1,108 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="uk">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>JK BMS monitor</title>
+<title>Оновлення монітора батареї</title>
 <style>
-  body { font-family: system-ui, sans-serif; background: #12161b; color: #e6edf3; margin: 0; padding: 24px 16px; }
+  body { font-family: system-ui, sans-serif; background: #12161b; color: #e6edf3; margin: 0; padding: 24px 16px;
+         font-size: 18px; line-height: 1.4; }
   main { max-width: 480px; margin: 0 auto; }
-  h2 { margin-top: 0; }
-  .dim { color: #8a949e; }
-  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 20px 0 12px; }
-  input[type=file] { flex: 1; min-width: 0; color: #e6edf3; }
-  button { padding: 8px 18px; font-size: 15px; border: 0; border-radius: 6px; background: #3ddc84; color: #12161b; cursor: pointer; }
-  button:disabled { background: #45607a; color: #8a949e; cursor: default; }
-  progress { width: 100%; height: 18px; accent-color: #3ddc84; }
-  #status { margin-top: 8px; min-height: 1.4em; }
+  h1 { font-size: 26px; margin: 0 0 16px; }
+  ol { padding-left: 24px; margin: 0 0 20px; }
+  li { margin-bottom: 8px; }
+  .dim { color: #8a949e; font-size: 13px; margin-top: 32px; }
+  input[type=file] { display: none; }
+  .big { display: block; width: 100%; box-sizing: border-box; padding: 16px; margin: 12px 0; font-size: 20px;
+         text-align: center; border: 0; border-radius: 10px; cursor: pointer; }
+  #choose { background: #2a313a; color: #e6edf3; }
+  #upload { background: #3ddc84; color: #12161b; font-weight: bold; }
+  .big:disabled, label.disabled { opacity: 0.4; cursor: default; pointer-events: none; }
+  #file_name { min-height: 1.4em; text-align: center; color: #8a949e; word-break: break-all; }
+  progress { width: 100%; height: 24px; accent-color: #3ddc84; margin-top: 12px; }
+  #status { margin-top: 12px; min-height: 1.4em; font-size: 20px; text-align: center; }
   .error { color: #ff5252; }
   .ok { color: #3ddc84; }
 </style>
 </head>
 <body>
 <main>
-<h2>Firmware update</h2>
-<div class="dim">Running firmware <span id="version">…</span></div>
+<h1>Оновлення монітора батареї</h1>
+<ol>
+  <li>Натисніть «Вибрати файл» і виберіть файл <b>jkbms.bin</b>.</li>
+  <li>Натисніть «Оновити».</li>
+  <li>Зачекайте, доки з'явиться «Готово». Не закривайте сторінку і не вимикайте монітор.</li>
+</ol>
 
-<div class="row">
-  <input id="choose_firmware" type="file" accept=".bin">
-  <button id="upload_firmware" type="button" onclick="uploadFirmware()">Upload</button>
-</div>
+<label id="choose" class="big" for="choose_firmware">Вибрати файл</label>
+<input id="choose_firmware" type="file" accept=".bin,application/octet-stream" onchange="fileChosen()">
+<div id="file_name"></div>
+<button id="upload" class="big" type="button" onclick="uploadFirmware()" disabled>Оновити</button>
+
 <progress id="progress" max="100" value="0" hidden></progress>
 <div id="status"></div>
+
+<div class="dim">Прошивка: <span id="version">…</span></div>
 </main>
 
 <script>
 const statusLine = document.getElementById("status");
+const input = document.getElementById("choose_firmware");
+const choose = document.getElementById("choose");
+const button = document.getElementById("upload");
 
 function setStatus(text, cls) {
   statusLine.textContent = text;
   statusLine.className = cls || "";
 }
 
+function fileChosen() {
+  const file = input.files[0];
+  document.getElementById("file_name").textContent = file ? file.name : "";
+  button.disabled = !file;
+  setStatus("");
+}
+
+function setBusy(busy) {
+  button.disabled = busy;
+  choose.classList.toggle("disabled", busy);
+}
+
 async function loadInfo() {
   const resp = await fetch("/info", {cache: "no-store"});
   const info = await resp.json();
-  document.getElementById("version").textContent = `${info.version}, built ${info.built} (${info.elf})`;
+  document.getElementById("version").textContent = `${info.version}, ${info.built} (${info.elf})`;
   return info;
 }
 
 // the board reboots into the new firmware: wait until it answers again
-async function waitForReboot(started) {
+async function waitForReboot() {
   for (let i = 0; i < 60; i++) {
     await new Promise(r => setTimeout(r, 2000));
     try {
-      const info = await loadInfo();
-      setStatus(`Done. Running firmware ${info.version}, built ${info.built}.`, "ok");
+      await loadInfo();
+      setStatus("Готово! Монітор оновлено. Сторінку можна закрити.", "ok");
       return;
     } catch (e) {
-      setStatus(`Rebooting… ${Math.round((Date.now() - started) / 1000)} s`);
+      setStatus("Монітор перезапускається…");
     }
   }
-  setStatus("The board did not come back. Check it is powered and on Wi-Fi.", "error");
+  setStatus("Монітор не відповідає. Перевірте, що він увімкнений, і відкрийте сторінку ще раз.", "error");
 }
 
 function uploadFirmware() {
-  const files = document.getElementById("choose_firmware").files;
-  if (files.length == 0) {
-    alert("No file selected!");
+  const file = input.files[0];
+  if (!file) {
     return;
   }
-  const input = document.getElementById("choose_firmware");
-  const button = document.getElementById("upload_firmware");
   const progress = document.getElementById("progress");
-  input.disabled = true;
-  button.disabled = true;
+  setBusy(true);
   progress.hidden = false;
   progress.value = 0;
 
   // the bar follows what the board has written: the browser's own upload
   // progress jumps to 100 % at once on some phones (Chrome on Android)
-  setStatus("Sending…");
+  setStatus("Надсилання…");
   let finished = false;   // a late /progress answer must not overwrite the result
   const poll = setInterval(async () => {
     try {
@@ -87,36 +111,34 @@ function uploadFirmware() {
       if (p.total > 0 && !finished) {
         const percent = Math.floor(100 * p.received / p.total);
         progress.value = percent;
-        setStatus(`Writing ${percent} % (${Math.round(p.received / 1024)} of ${Math.round(p.total / 1024)} KB)`);
+        setStatus(`Оновлення… ${percent} %`);
       }
     } catch (e) {
       // the board is busy or rebooting; try again on the next tick
     }
   }, 700);
 
+  const failed = (text) => {
+    finished = true;
+    clearInterval(poll);
+    setStatus(text, "error");
+    setBusy(false);
+  };
   const xhttp = new XMLHttpRequest();
   xhttp.onload = () => {
-    finished = true;
-    clearInterval(poll);
-    if (xhttp.status == 200) {
-      progress.value = 100;
-      setStatus("Uploaded. Rebooting…");
-      waitForReboot(Date.now());
-    } else {
-      setStatus(`Error ${xhttp.status}: ${xhttp.responseText}`, "error");
-      input.disabled = false;
-      button.disabled = false;
+    if (xhttp.status != 200) {
+      failed(`Помилка: ${xhttp.responseText}. Спробуйте ще раз.`);
+      return;
     }
-  };
-  xhttp.onerror = () => {
     finished = true;
     clearInterval(poll);
-    setStatus("The connection was closed. Try again.", "error");
-    input.disabled = false;
-    button.disabled = false;
+    progress.value = 100;
+    setStatus("Монітор перезапускається…");
+    waitForReboot();
   };
+  xhttp.onerror = () => failed("Зв'язок перервався. Спробуйте ще раз.");
   xhttp.open("POST", "/upload_firmware", true);
-  xhttp.send(files[0]);
+  xhttp.send(file);
 }
 
 loadInfo().catch(() => {});

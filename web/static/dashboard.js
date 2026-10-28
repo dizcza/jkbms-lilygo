@@ -90,7 +90,48 @@ function details(id, title, body) {
   return `<details id="${id}"><summary>${title}</summary>${body}</details>`;
 }
 
-function renderCard(bms, now) {
+// boards with the remote-maintenance firmware report their diagnostics
+function renderBoard(d, now) {
+  const fw = d.fw || {};
+  const diag = d.diag || {};
+  const lines = [`last report ${agoSpan(d.received, now)} · upload #${d.wake ?? "?"}`];
+  if (fw.version) {
+    lines.push(`firmware ${esc(fw.version)} built ${esc(fw.built)} (${esc((fw.elf || "").slice(0, 8))}) · ` +
+               `uptime ${ago(diag.uptime).replace(" ago", "")} · reset: ${esc(diag.reset)} · ` +
+               `Wi-Fi ${diag.wifi_rssi} dBm · heap ${Math.round(diag.heap / 1024)} KB` +
+               (fw.ota_error ? ` · <span class="error">OTA: ${esc(fw.ota_error)}</span>` : ""));
+    for (const slot of diag.slots || []) {
+      lines.push(`slot ${slot.slot}: ${esc(slot.link)}${slot.mac ? " · " + slot.mac : ""}`);
+    }
+  } else {
+    lines.push("old firmware without diagnostics");
+  }
+  const ble = (diag.ble || []).map(b =>
+    `<tr><td>${b.mac}</td><td>${esc(b.name)}</td><td>${b.rssi} dBm</td><td>${b.jk ? "JK" : ""}</td>` +
+    `<td>${b.age} s ago</td></tr>`).join("");
+  return `
+  <section class="card">
+    <h2>Board ${esc(d.device)}</h2>
+    ${lines.map(l => `<div class="dim">${l}</div>`).join("")}
+    ${ble ? details(`ble-${d.device}`, `Bluetooth devices around (${diag.ble.length})`,
+                    `<table><tr><th>MAC</th><th>Name</th><th>RSSI</th><th></th><th>Seen</th></tr>${ble}</table>`)
+          : ""}
+  </section>`;
+}
+
+// MACs the boards with diagnostics watch now
+function watchedMacs(devices) {
+  const macs = new Set();
+  let known = false;
+  for (const d of devices) {
+    if (!d.diag) continue;
+    known = true;
+    (d.diag.slots || []).forEach(s => s.mac && macs.add(s.mac));
+  }
+  return known ? macs : null;
+}
+
+function renderCard(bms, now, watched) {
   const fresh = bms.online && !bms.stale;
   const dotColor = fresh ? "var(--ok)" : "var(--error)";
   const errors = bms.error_labels || [];
@@ -106,7 +147,8 @@ function renderCard(bms, now) {
     <h2><span class="dot" style="background:${dotColor}"></span>${esc(bms.name || bms.mac)}</h2>
     <div class="dim">${esc(bms.model || "")} · ${bms.mac} · hardware version ${esc(bms.hw || "?")} ·
       software version ${esc(bms.sw || "?")}</div>
-    <div class="dim">${status}board seen ${agoSpan(bms.received, now)}</div>
+    <div class="dim">${status}board report ${agoSpan(bms.received, now)}</div>
+    ${watched && !watched.has(bms.mac) ? '<p class="warn">No board watches this BMS any more.</p>' : ""}
     ${errors.length ? `<p class="error">Errors: ${errors.map(esc).join(", ")}</p>` : ""}
     <div class="stats">
       <div class="stat"><div class="label">Pack</div><div class="value">${fmt(bms.voltage, 2, " V")}</div></div>
@@ -139,17 +181,18 @@ async function drawChart(bms) {
   const rows = await resp.json();
   const canvas = document.getElementById(`chart-${id}`);
   if (!canvas) return;
-  const labels = rows.map(r => new Date(r.ts * 1000).toLocaleString([], {
-    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}));
+  // x is the time in ms on a linear scale, so that gaps between readings show as gaps
+  const timeLabel = ms => new Date(ms).toLocaleString([], {
+    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"});
+  const points = key => rows.map(r => ({x: r.ts * 1000, y: r[key]}));
   charts[id] = new Chart(canvas, {
     type: "line",
     data: {
-      labels,
       datasets: [
-        {label: "Max cell, V", data: rows.map(r => r.max_cell), borderColor: "#ff5252", yAxisID: "cell"},
-        {label: "Min cell, V", data: rows.map(r => r.min_cell), borderColor: "#42a5f5", yAxisID: "cell"},
-        {label: "SOC, %", data: rows.map(r => r.soc), borderColor: "#3ddc84", yAxisID: "pct"},
-        {label: "Current, A", data: rows.map(r => r.current), borderColor: "#ffa726", yAxisID: "amp"},
+        {label: "Max cell, V", data: points("max_cell"), borderColor: "#ff5252", yAxisID: "cell"},
+        {label: "Min cell, V", data: points("min_cell"), borderColor: "#42a5f5", yAxisID: "cell"},
+        {label: "SOC, %", data: points("soc"), borderColor: "#3ddc84", yAxisID: "pct"},
+        {label: "Current, A", data: points("current"), borderColor: "#ffa726", yAxisID: "amp"},
       ],
     },
     options: {
@@ -157,9 +200,13 @@ async function drawChart(bms) {
       maintainAspectRatio: false,
       elements: {point: {radius: 0}, line: {borderWidth: 1.5}},
       interaction: {mode: "index", intersect: false},
-      plugins: {legend: {labels: {color: "#e6edf3"}}},
+      plugins: {
+        legend: {labels: {color: "#e6edf3"}},
+        tooltip: {callbacks: {title: items => timeLabel(items[0].parsed.x)}},
+      },
       scales: {
-        x: {ticks: {color: "#8a949e", maxTicksLimit: 8}, grid: {color: "#2a313a"}},
+        x: {type: "linear", ticks: {color: "#8a949e", maxTicksLimit: 8, callback: timeLabel},
+            grid: {color: "#2a313a"}},
         cell: {position: "left", ticks: {color: "#8a949e"}, grid: {color: "#2a313a"}},
         pct: {position: "right", min: 0, max: 100, ticks: {color: "#3ddc84"}, grid: {display: false}},
         amp: {position: "right", ticks: {color: "#ffa726"}, grid: {display: false}},
@@ -179,13 +226,15 @@ async function refresh() {
 
 function render(data) {
   const list = document.getElementById("bms-list");
-  if (!data.bms.length) {
+  if (!data.bms.length && !data.devices.length) {
     list.innerHTML = '<p class="dim">No data from the board yet.</p>';
     return;
   }
   Object.values(charts).forEach(c => c.destroy());
   Object.keys(charts).forEach(k => delete charts[k]);
-  list.innerHTML = data.bms.map(b => renderCard(b, data.now)).join("");
+  const watched = watchedMacs(data.devices);
+  list.innerHTML = data.bms.map(b => renderCard(b, data.now, watched)).join("") +
+                   data.devices.map(d => renderBoard(d, data.now)).join("");
   data.bms.forEach(drawChart);
   document.getElementById("updated").textContent = `Loaded ${new Date().toLocaleTimeString()}`;
 }

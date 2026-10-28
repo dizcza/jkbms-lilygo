@@ -6,7 +6,8 @@
  * moment ago continues by itself; otherwise device info (0x97) followed by
  * cell info (0x96) starts the stream (0x96 alone does not). The BMS beeps on
  * every command, so the settings and the logbook are requested only when
- * asked for, at most once per connection.
+ * asked for, at most once per connection, and delivered into the buffer of
+ * whoever asked: memory is too short to keep them.
  */
 
 #include "jkbms_ble.h"
@@ -19,6 +20,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_attr.h"
+#include "esp_system.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_bt.h"
@@ -43,11 +45,17 @@
 #define INFO_REQUEST_ATTEMPTS       2
 #define REQUEST_PERIOD_US           (3 * 1000000LL)
 #define SETTINGS_WAIT_US            (3 * 1000000LL)     // settings often come by themselves
+#define EXTRAS_REQUEST_ATTEMPTS     3                   // per connection: a far BMS misses requests
+#define EXTRAS_RETRY_US             (10 * 1000000LL)
 #define STREAM_STALL_US             (3 * 1000000LL)
 #define LINK_DEAD_US                (60 * 1000000LL)
 #define NOT_FOUND_US                (15 * 1000000LL)
 #define NO_DATA_US                  (20 * 1000000LL)
 #define FOUND_MAX                   8
+#define EXTRAS_SINKS                2       // the uploader and the display
+#define SEEN_MAX                    16
+#define REPLACE_AFTER_US            (10 * 1000000LL)       // saved BMS never seen: switch to another one
+#define REPLACE_FOUND_AGE_US        (2 * 60 * 1000000LL)
 #define NVS_NAMESPACE               "jkbms"
 
 
@@ -63,9 +71,11 @@ typedef struct {
     int64_t notify_ready_us;
     uint8_t info_requests;
     bool info_this_link;               // device info received on this connection
-    bool settings_requested;           // on this connection
-    bool logbook_requested;            // on this connection
-    bool logbook_wanted;
+    uint8_t settings_requests;         // on this connection
+    uint8_t logbook_requests;          // on this connection
+    int64_t extras_request_us;         // the last settings or logbook request
+    jkbms_extras_t *sinks[EXTRAS_SINKS];  // pending jkbms_ble_fetch_extras() requests
+    bool seen;                         // advertised since boot or since the MAC was set
     int64_t link_since_us;
     int64_t last_request_us;
     jkbms_assembler_t assembler;
@@ -79,8 +89,8 @@ static bool m_scan_params_set = false;
 static bool m_scanning = false;
 static int m_connecting_idx = -1;
 static bool m_discovery = false;
-static bool m_fetch_extras = true;
 static int64_t m_refresh_us = STREAM_STALL_US;   // 0: never reconnect for fresh data
+static bool m_shut_down = false;                // Bluetooth is off for a firmware update
 
 // device info survives deep sleep, so that it is requested once per power-on
 typedef struct {
@@ -93,6 +103,7 @@ typedef struct {
 
 static RTC_DATA_ATTR info_cache_t m_info_cache[JKBMS_DEVICES_MAX];
 static jkbms_found_t m_found[FOUND_MAX];
+static jkbms_seen_t m_seen[SEEN_MAX];  // every BLE advertiser, for diagnostics
 static const char *TAG = "jkbms";
 
 static esp_ble_scan_params_t m_scan_params = {
@@ -100,7 +111,7 @@ static esp_ble_scan_params_t m_scan_params = {
     .own_addr_type          = BLE_ADDR_TYPE_PUBLIC,
     .scan_filter_policy     = BLE_SCAN_FILTER_ALLOW_ALL,
     .scan_interval          = 0x50,
-    .scan_window            = 0x30,
+    .scan_window            = 0x50,     // scan all the time: a far BMS is heard only now and then
     .scan_duplicate         = BLE_SCAN_DUPLICATE_DISABLE
 };
 
@@ -248,8 +259,9 @@ static void slot_reset_link(jkbms_slot_t *slot) {
     slot->notify_ready = false;
     slot->info_requests = 0;
     slot->info_this_link = false;
-    slot->settings_requested = false;
-    slot->logbook_requested = false;
+    slot->settings_requests = 0;
+    slot->logbook_requests = 0;
+    slot->extras_request_us = 0;
     slot->assembler.len = 0;
     slot_set_link(slot, slot->st.mac_known ? JKBMS_LINK_SEARCHING : JKBMS_LINK_UNASSIGNED);
 }
@@ -330,6 +342,34 @@ static void found_update(const uint8_t *bda, const char *name, int rssi) {
 }
 
 
+static void seen_update(const esp_ble_gap_cb_param_t *param, const char *name, bool jk) {
+    jkbms_seen_t *entry = NULL;
+    jkbms_seen_t *oldest = &m_seen[0];
+    for (int i = 0; i < SEEN_MAX; i++) {
+        if (m_seen[i].seen_us != 0 && memcmp(m_seen[i].mac, param->scan_rst.bda, 6) == 0) {
+            entry = &m_seen[i];
+            break;
+        }
+        if (m_seen[i].seen_us < oldest->seen_us) {
+            oldest = &m_seen[i];
+        }
+    }
+    if (entry == NULL) {
+        entry = oldest;
+        memset(entry, 0, sizeof(*entry));
+        memcpy(entry->mac, param->scan_rst.bda, 6);
+    }
+    if (name[0] != '\0') {
+        strlcpy(entry->name, name, sizeof(entry->name));
+    }
+    entry->rssi = param->scan_rst.rssi;
+    entry->addr_type = param->scan_rst.ble_addr_type;
+    entry->jk = jk;
+    entry->seen_us = esp_timer_get_time();
+    entry->count++;
+}
+
+
 static void connect_slot(int idx, esp_ble_gap_cb_param_t *param) {
     jkbms_slot_t *slot = &m_slots[idx];
     memcpy(slot->st.mac, param->scan_rst.bda, 6);
@@ -380,13 +420,20 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
             m_scanning = false;
             break;
         }
-        if (param->scan_rst.search_evt != ESP_GAP_SEARCH_INQ_RES_EVT || m_connecting_idx >= 0) {
+        if (param->scan_rst.search_evt != ESP_GAP_SEARCH_INQ_RES_EVT || m_connecting_idx >= 0 || m_shut_down) {
             break;
         }
         char name[32];
         const uint16_t adv_len = param->scan_rst.adv_data_len + param->scan_rst.scan_rsp_len;
-        if (adv_is_jkbms(param->scan_rst.ble_adv, adv_len, name, sizeof(name))) {
+        const bool jk = adv_is_jkbms(param->scan_rst.ble_adv, adv_len, name, sizeof(name));
+        if (jk) {
             found_update(param->scan_rst.bda, name, param->scan_rst.rssi);
+        }
+        seen_update(param, name, jk);
+        jkbms_slot_t *advertiser = slot_by_bda(param->scan_rst.bda);
+        if (advertiser != NULL) {
+            advertiser->seen = true;
+            advertiser->st.rssi = param->scan_rst.rssi;
         }
         const int idx = slot_for_advertiser(param->scan_rst.bda);
         if (idx >= 0) {
@@ -466,6 +513,27 @@ static void on_search_complete(jkbms_slot_t *slot) {
 }
 
 
+static void slot_drop_done_sinks(jkbms_slot_t *slot) {
+    for (int i = 0; i < EXTRAS_SINKS; i++) {
+        jkbms_extras_t *x = slot->sinks[i];
+        if (x != NULL && !x->want_settings && !x->want_logbook) {
+            slot->sinks[i] = NULL;
+        }
+    }
+}
+
+
+static bool slot_wants(const jkbms_slot_t *slot, bool settings) {
+    for (int i = 0; i < EXTRAS_SINKS; i++) {
+        const jkbms_extras_t *x = slot->sinks[i];
+        if (x != NULL && (settings ? x->want_settings : x->want_logbook)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+
 static void on_frame(jkbms_slot_t *slot, const uint8_t *frame) {
     const int idx = slot - m_slots;
     switch (frame[4]) {
@@ -501,12 +569,21 @@ static void on_frame(jkbms_slot_t *slot, const uint8_t *frame) {
         }
         break;
     case JKBMS_FRAME_TYPE_LOGBOOK:
-        slot->st.logbook_count = jkbms_decode_logbook(frame, &slot->st.logbook_total, slot->st.logbook,
-                                                      JKBMS_LOGBOOK_FRAME_ENTRIES);
-        slot->st.logbook_valid = true;
-        slot->logbook_wanted = false;
-        ESP_LOGI(TAG, "[BMS %d] logbook: %u of %lu events", idx + 1, slot->st.logbook_count,
-                 (unsigned long) slot->st.logbook_total);
+        for (int i = 0; i < EXTRAS_SINKS; i++) {
+            jkbms_extras_t *x = slot->sinks[i];
+            if (x == NULL || !x->want_logbook || !slot->info_this_link) {
+                continue;
+            }
+            x->logbook_count = jkbms_decode_logbook(frame, &x->logbook_total, x->logbook,
+                                                    JKBMS_LOGBOOK_FRAME_ENTRIES);
+            x->logbook_uptime_s = jkbms_bms_now_s(&slot->st);
+            x->logbook_read_us = esp_timer_get_time();
+            x->logbook_valid = true;
+            x->want_logbook = false;
+            ESP_LOGI(TAG, "[BMS %d] logbook: %u of %lu events", idx + 1, x->logbook_count,
+                     (unsigned long) x->logbook_total);
+        }
+        slot_drop_done_sinks(slot);
         break;
     case JKBMS_FRAME_TYPE_SETTINGS: {
         jkbms_proto_t proto = slot->st.proto;
@@ -514,10 +591,19 @@ static void on_frame(jkbms_slot_t *slot, const uint8_t *frame) {
             // the settings frame arrives before the first cell info frame
             proto = JKBMS_PROTO_JK02_32S;
         }
-        slot->st.settings_valid = jkbms_decode_settings(frame, proto, &slot->st.settings);
-        ESP_LOGI(TAG, "[BMS %d] settings: %u cells, %.0f Ah, UVP %.3f V, discharge %s", idx + 1,
-                 slot->st.settings.cell_count, slot->st.settings.capacity, slot->st.settings.cell_uvp,
-                 slot->st.settings.discharge_enabled ? "on" : "off");
+        // it also comes unasked whenever the stream starts: kept only when someone waits for it
+        for (int i = 0; i < EXTRAS_SINKS; i++) {
+            jkbms_extras_t *x = slot->sinks[i];
+            if (x == NULL || !x->want_settings || !jkbms_decode_settings(frame, proto, &x->settings)) {
+                continue;
+            }
+            x->settings_valid = true;
+            x->want_settings = false;
+            ESP_LOGI(TAG, "[BMS %d] settings: %u cells, %.0f Ah, UVP %.3f V, discharge %s", idx + 1,
+                     x->settings.cell_count, x->settings.capacity, x->settings.cell_uvp,
+                     x->settings.discharge_enabled ? "on" : "off");
+        }
+        slot_drop_done_sinks(slot);
         break;
     }
     default:
@@ -653,22 +739,70 @@ static void slot_request_extras(jkbms_slot_t *slot, int64_t now) {
     if (now - slot->last_request_us < REQUEST_PERIOD_US) {
         return;
     }
+    const bool want_logbook = slot_wants(slot, false);
     // the logbook needs the current BMS uptime from the device info
-    const bool need_info = !slot->st.info_valid
-            || (!slot->info_this_link && (slot->logbook_wanted || (m_fetch_extras && !slot->st.logbook_valid)));
+    const bool need_info = !slot->st.info_valid || (!slot->info_this_link && want_logbook);
     if (need_info && slot->info_requests < INFO_REQUEST_ATTEMPTS) {
         slot_send_command(slot, JKBMS_COMMAND_DEVICE_INFO);
         slot->info_requests++;
-    } else if (m_fetch_extras && !slot->st.settings_valid && !slot->settings_requested
+    } else if (now - slot->extras_request_us < EXTRAS_RETRY_US) {
+        // waiting for the answer; a request lost on a weak link is repeated after that
+    } else if (slot_wants(slot, true) && slot->settings_requests < EXTRAS_REQUEST_ATTEMPTS
                && now - slot->link_since_us > SETTINGS_WAIT_US) {
         // the BMS sends its settings frame when (re)starting the stream
         slot_send_command(slot, JKBMS_COMMAND_CELL_INFO);
-        slot->settings_requested = true;
-    } else if ((slot->logbook_wanted || (m_fetch_extras && !slot->st.logbook_valid)) && !slot->logbook_requested
-               && slot->info_this_link) {
+        slot->settings_requests++;
+        slot->extras_request_us = now;
+    } else if (want_logbook && slot->logbook_requests < EXTRAS_REQUEST_ATTEMPTS && slot->info_this_link) {
         slot_send_command(slot, JKBMS_COMMAND_LOGBOOK);
-        slot->logbook_requested = true;
+        slot->logbook_requests++;
+        slot->extras_request_us = now;
     }
+}
+
+
+/**
+ * A board moved to another place would keep searching for the BMS saved
+ * there. When the only assigned BMS has not been seen for REPLACE_AFTER_US
+ * since boot, the strongest other JK BMS around takes its place.
+ */
+static void replace_missing(int64_t now) {
+    static bool done = false;
+    if (done || now < REPLACE_AFTER_US) {
+        return;
+    }
+    jkbms_slot_t *missing = NULL;
+    for (int i = 0; i < JKBMS_DEVICES_MAX; i++) {
+        jkbms_slot_t *slot = &m_slots[i];
+        if (slot->st.link == JKBMS_LINK_UNASSIGNED) {
+            continue;
+        }
+        if (slot->seen || missing != NULL || slot->st.link != JKBMS_LINK_SEARCHING
+                || now - slot->link_since_us < REPLACE_AFTER_US) {
+            return;
+        }
+        missing = slot;
+    }
+    if (missing == NULL) {
+        return;
+    }
+    const jkbms_found_t *candidate = NULL;
+    for (int i = 0; i < FOUND_MAX; i++) {
+        if (m_found[i].seen_us == 0 || now - m_found[i].seen_us > REPLACE_FOUND_AGE_US) {
+            continue;
+        }
+        if (candidate == NULL || m_found[i].rssi > candidate->rssi) {
+            candidate = &m_found[i];
+        }
+    }
+    if (candidate == NULL) {
+        return;
+    }
+    done = true;
+    const int idx = missing - m_slots;
+    ESP_LOGW(TAG, "[BMS %d] saved " MACSTR_BDA " never seen, switching to " MACSTR_BDA " '%s'", idx + 1,
+             MAC2STR_BDA(missing->st.mac), MAC2STR_BDA(candidate->mac), candidate->name);
+    jkbms_ble_set_mac(idx, candidate->mac);
 }
 
 
@@ -677,6 +811,10 @@ static void jkbms_supervisor_task(void *args) {
         vTaskDelay(pdMS_TO_TICKS(500));
         xSemaphoreTakeRecursive(m_lock, portMAX_DELAY);
         const int64_t now = esp_timer_get_time();
+        if (m_shut_down) {
+            xSemaphoreGiveRecursive(m_lock);
+            continue;
+        }
         bool searching = false;
         for (int i = 0; i < JKBMS_DEVICES_MAX; i++) {
             jkbms_slot_t *slot = &m_slots[i];
@@ -732,6 +870,7 @@ static void jkbms_supervisor_task(void *args) {
                 break;
             }
         }
+        replace_missing(now);
         if ((searching || m_discovery) && m_scan_params_set && !m_scanning && m_connecting_idx < 0) {
             if (esp_ble_gap_start_scanning(SCAN_DURATION_S) == ESP_OK) {
                 m_scanning = true;
@@ -778,6 +917,14 @@ esp_err_t jkbms_ble_init(void) {
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
     ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
+    // the strongest signal (+9 dBm instead of +3 dBm), so that a far BMS hears the connection request
+    const esp_ble_power_type_t power_types[] = {
+        ESP_BLE_PWR_TYPE_DEFAULT, ESP_BLE_PWR_TYPE_SCAN, ESP_BLE_PWR_TYPE_CONN_HDL0, ESP_BLE_PWR_TYPE_CONN_HDL1,
+        ESP_BLE_PWR_TYPE_CONN_HDL2,
+    };
+    for (int i = 0; i < sizeof(power_types) / sizeof(power_types[0]); i++) {
+        esp_ble_tx_power_set(power_types[i], ESP_PWR_LVL_P9);
+    }
     ESP_ERROR_CHECK(esp_bluedroid_init());
     ESP_ERROR_CHECK(esp_bluedroid_enable());
     ESP_ERROR_CHECK(esp_ble_gap_register_callback(gap_event_handler));
@@ -785,7 +932,7 @@ esp_err_t jkbms_ble_init(void) {
     ESP_ERROR_CHECK(esp_ble_gatt_set_local_mtu(JKBMS_LOCAL_MTU));
     ESP_ERROR_CHECK(esp_ble_gattc_app_register(JKBMS_APP_ID));
 
-    if (xTaskCreate(jkbms_supervisor_task, "jkbms", 3072, NULL, 5, NULL) != pdPASS) {
+    if (xTaskCreate(jkbms_supervisor_task, "jkbms", 4096, NULL, 5, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -808,8 +955,41 @@ void jkbms_ble_set_refresh_period_s(int period_s) {
 }
 
 
-void jkbms_ble_set_fetch_extras(bool enable) {
-    m_fetch_extras = enable;
+
+
+
+void jkbms_ble_shutdown(void) {
+    xSemaphoreTakeRecursive(m_lock, portMAX_DELAY);
+    if (m_shut_down) {
+        xSemaphoreGiveRecursive(m_lock);
+        return;
+    }
+    m_shut_down = true;   // the supervisor and the callbacks leave the stack alone from now on
+    if (m_scanning) {
+        esp_ble_gap_stop_scanning();
+        m_scanning = false;
+    }
+    bool connected = false;
+    for (int i = 0; i < JKBMS_DEVICES_MAX; i++) {
+        jkbms_slot_t *slot = &m_slots[i];
+        if (slot->st.link >= JKBMS_LINK_CONNECTING) {
+            esp_ble_gap_disconnect(slot->st.mac);
+            connected = true;
+        }
+    }
+    m_connecting_idx = -1;
+    xSemaphoreGiveRecursive(m_lock);
+    if (connected) {
+        vTaskDelay(pdMS_TO_TICKS(500));   // let the BMS see a clean disconnect
+    }
+    const size_t before = esp_get_free_heap_size();
+    esp_bluedroid_disable();
+    esp_bluedroid_deinit();
+    esp_bt_controller_disable();
+    esp_bt_controller_deinit();
+    // returns the controller memory to the heap for good: only a restart brings Bluetooth back
+    esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+    ESP_LOGW(TAG, "Bluetooth off, heap %u -> %u bytes", (unsigned) before, (unsigned) esp_get_free_heap_size());
 }
 
 
@@ -842,14 +1022,46 @@ int jkbms_ble_get_found(jkbms_found_t *list, int max, int64_t max_age_us) {
 }
 
 
-void jkbms_ble_request_logbook(int idx) {
+bool jkbms_ble_fetch_extras(int idx, jkbms_extras_t *extras) {
     if (idx < 0 || idx >= JKBMS_DEVICES_MAX) {
-        return;
+        return false;
     }
     xSemaphoreTakeRecursive(m_lock, portMAX_DELAY);
     jkbms_slot_t *slot = &m_slots[idx];
-    slot->logbook_wanted = true;
-    slot->logbook_requested = false;
+    int free_sink = -1;
+    for (int i = 0; i < EXTRAS_SINKS; i++) {
+        if (slot->sinks[i] == extras) {
+            free_sink = i;   // asked again: the same request
+            break;
+        }
+        if (slot->sinks[i] == NULL && free_sink < 0) {
+            free_sink = i;
+        }
+    }
+    if (free_sink >= 0) {
+        slot->sinks[free_sink] = extras;
+        // a new request asks the BMS again, even if this connection asked before
+        if (extras->want_settings) {
+            slot->settings_requests = 0;
+        }
+        if (extras->want_logbook) {
+            slot->logbook_requests = 0;
+        }
+    }
+    xSemaphoreGiveRecursive(m_lock);
+    return free_sink >= 0;
+}
+
+
+void jkbms_ble_cancel_extras(jkbms_extras_t *extras) {
+    xSemaphoreTakeRecursive(m_lock, portMAX_DELAY);
+    for (int s = 0; s < JKBMS_DEVICES_MAX; s++) {
+        for (int i = 0; i < EXTRAS_SINKS; i++) {
+            if (m_slots[s].sinks[i] == extras) {
+                m_slots[s].sinks[i] = NULL;
+            }
+        }
+    }
     xSemaphoreGiveRecursive(m_lock);
 }
 
@@ -870,6 +1082,65 @@ bool jkbms_ble_assign(int idx, const uint8_t mac[6]) {
     }
     xSemaphoreGiveRecursive(m_lock);
     return ok;
+}
+
+
+bool jkbms_ble_set_mac(int idx, const uint8_t mac[6]) {
+    static const uint8_t zero[6] = { 0 };
+    if (idx < 0 || idx >= JKBMS_DEVICES_MAX) {
+        return false;
+    }
+    xSemaphoreTakeRecursive(m_lock, portMAX_DELAY);
+    jkbms_slot_t *slot = &m_slots[idx];
+    if (slot->st.link >= JKBMS_LINK_CONNECTING) {
+        esp_ble_gap_disconnect(slot->st.mac);
+    }
+    if (idx == m_connecting_idx) {
+        m_connecting_idx = -1;
+    }
+    slot_reset_link(slot);
+    memset(&slot->st, 0, sizeof(slot->st));
+    slot->seen = false;
+    memset(slot->sinks, 0, sizeof(slot->sinks));
+    m_info_cache[idx].valid = false;
+    slot_set_link(slot, JKBMS_LINK_UNASSIGNED);
+    bool ok = true;
+    if (mac == NULL || memcmp(mac, zero, 6) == 0) {
+        nvs_handle_t handle;
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+            char key[8];
+            nvs_mac_key(idx, key);
+            nvs_erase_key(handle, key);
+            nvs_commit(handle);
+            nvs_close(handle);
+        }
+        ESP_LOGI(TAG, "[BMS %d] unassigned", idx + 1);
+    } else {
+        ok = jkbms_ble_assign(idx, mac);
+    }
+    xSemaphoreGiveRecursive(m_lock);
+    return ok;
+}
+
+
+int jkbms_ble_get_seen(jkbms_seen_t *list, int max, int64_t max_age_us) {
+    xSemaphoreTakeRecursive(m_lock, portMAX_DELAY);
+    const int64_t now = esp_timer_get_time();
+    int count = 0;
+    for (int i = 0; i < SEEN_MAX && count < max; i++) {
+        if (m_seen[i].seen_us != 0 && now - m_seen[i].seen_us <= max_age_us) {
+            list[count++] = m_seen[i];
+        }
+    }
+    xSemaphoreGiveRecursive(m_lock);
+    for (int i = 1; i < count; i++) {
+        for (int j = i; j > 0 && list[j].rssi > list[j - 1].rssi; j--) {
+            jkbms_seen_t tmp = list[j];
+            list[j] = list[j - 1];
+            list[j - 1] = tmp;
+        }
+    }
+    return count;
 }
 
 

@@ -191,33 +191,92 @@ bool uploader_get_network(char *ssid, size_t ssid_size, char *ip, size_t ip_size
 }
 
 
-esp_err_t uploader_send(const char *json) {
-#if !defined(ENV_JKBMS_UPLOAD_URL) || !defined(ENV_JKBMS_API_TOKEN)
-    ESP_LOGW(TAG, "No upload URL or API token, upload skipped");
+int uploader_wifi_rssi(void) {
+    wifi_ap_record_t ap;
+    if (!uploader_connected() || esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+        return 0;
+    }
+    return ap.rssi;
+}
+
+
+bool uploader_api_url(const char *name, char *url, size_t url_size) {
+#ifdef ENV_JKBMS_UPLOAD_URL
+    // the upload URL ends with /api/status: the other endpoints are next to it
+    const char *slash = strrchr(ENV_JKBMS_UPLOAD_URL, '/');
+    if (slash == NULL) {
+        return false;
+    }
+    snprintf(url, url_size, "%.*s/%s", (int) (slash - ENV_JKBMS_UPLOAD_URL), ENV_JKBMS_UPLOAD_URL, name);
+    return true;
+#else
+    return false;
+#endif
+}
+
+
+esp_err_t uploader_post(const char *url, const char *content_type, const char *body, size_t len,
+                        char *resp, size_t resp_size) {
+#ifndef ENV_JKBMS_API_TOKEN
+    ESP_LOGW(TAG, "No API token, upload skipped");
     return ESP_ERR_NOT_SUPPORTED;
 #else
-    if (m_events == NULL || !(xEventGroupGetBits(m_events) & BIT_CONNECTED)) {
+    if (resp != NULL && resp_size > 0) {
+        resp[0] = '\0';
+    }
+    if (!uploader_connected()) {
         ESP_LOGW(TAG, "Wi-Fi is not connected, upload skipped");
         return ESP_ERR_INVALID_STATE;
     }
 
     const esp_http_client_config_t config = {
-        .url = ENV_JKBMS_UPLOAD_URL,
+        .url = url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = HTTP_TIMEOUT_MS,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
-    esp_http_client_set_header(client, "Content-Type", "application/json");
+    if (client == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    esp_http_client_set_header(client, "Content-Type", content_type);
     esp_http_client_set_header(client, "Authorization", "Bearer " ENV_JKBMS_API_TOKEN);
-    esp_http_client_set_post_field(client, json, strlen(json));
-    esp_err_t err = esp_http_client_perform(client);
-    const int status = esp_http_client_get_status_code(client);
-    esp_http_client_cleanup(client);
-
-    if (err == ESP_OK && status != 200) {
+    int status = -1;
+    esp_err_t err = esp_http_client_open(client, len);
+    size_t written = 0;
+    while (err == ESP_OK && written < len) {
+        const int n = esp_http_client_write(client, body + written, len - written);
+        if (n <= 0) {
+            err = ESP_FAIL;
+            break;
+        }
+        written += n;
+    }
+    if (err == ESP_OK && esp_http_client_fetch_headers(client) < 0) {
         err = ESP_FAIL;
     }
-    ESP_LOGI(TAG, "POST %u bytes: %s, HTTP %d", (unsigned) strlen(json), esp_err_to_name(err), status);
+    if (err == ESP_OK) {
+        status = esp_http_client_get_status_code(client);
+        if (resp != NULL && resp_size > 1) {
+            const int n = esp_http_client_read_response(client, resp, resp_size - 1);
+            resp[n > 0 ? n : 0] = '\0';
+        }
+        if (status != 200) {
+            err = ESP_FAIL;
+        }
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    ESP_LOGI(TAG, "POST %u bytes to %s: %s, HTTP %d", (unsigned) len, url, esp_err_to_name(err), status);
     return err;
+#endif
+}
+
+
+esp_err_t uploader_send(const char *json, char *resp, size_t resp_size) {
+#ifndef ENV_JKBMS_UPLOAD_URL
+    ESP_LOGW(TAG, "No upload URL, upload skipped");
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    return uploader_post(ENV_JKBMS_UPLOAD_URL, "application/json", json, strlen(json), resp, resp_size);
 #endif
 }

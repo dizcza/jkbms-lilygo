@@ -4,6 +4,7 @@
 .cache/
 .idea/
 build/
+build-collect/
 ignored/
 sdkconfig.old
 sdkconfig

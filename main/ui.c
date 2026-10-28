@@ -28,6 +28,7 @@
 #include "buttons.h"
 #include "jkbms_ble.h"
 #include "lcd.h"
+#include "remote.h"
 #include "uploader.h"
 #include "webserver.h"
 
@@ -37,6 +38,7 @@
 #define COLOR_DIM         0x8A949E
 #define COLOR_OK          0x3DDC84
 #define COLOR_WARN        0xFFA726
+#define COLOR_READ        0xFFD600           // "read", waiting to be sent
 #define COLOR_ERROR       0xFF5252
 #define COLOR_MAX         0xFF5252
 #define COLOR_MIN         0x42A5F5
@@ -52,7 +54,9 @@
 
 #define SPINNER_SIZE      100
 
-#define RESULT_SHOW_US    (10 * 1000000LL)  // the first-upload check mark or cross
+#define UI_REFRESH_MS     500
+#define RESULT_SHOW_US    (7 * 1000000LL)   // the first-upload check mark or cross
+#define READ_SHOW_US      (5 * 1000000LL)   // the yellow "read" check mark
 #define RESULT_RING_D     104
 #define RESULT_DISC_D     88
 #define RESULT_Y          28                 // top of the ring
@@ -228,6 +232,7 @@ static struct {
 
 extern const lv_image_dsc_t ohm_glyph;
 extern const lv_image_dsc_t sent_text;
+extern const lv_image_dsc_t read_text;
 
 static void create_picker_page(lv_obj_t *scr);
 static void ui_fetch_status(void);
@@ -236,6 +241,9 @@ static int first_free_slot(void);
 static int assigned_count(void);
 
 static jkbms_status_t m_status[JKBMS_DEVICES_MAX];
+// the settings and the logbook, read while their pages are shown and freed when left
+static jkbms_extras_t *m_extras;
+static int m_extras_bms = -1;
 
 
 static lv_obj_t* make_label(lv_obj_t *parent, const lv_font_t *font, uint32_t color, int x, int y) {
@@ -378,7 +386,12 @@ static void create_board_page(lv_obj_t *scr) {
     settings_page_t *p = &m_ui.board;
     p->cont = make_container(scr, HEADER_H, CONTENT_H);
     p->title = make_label(p->cont, &lv_font_montserrat_20, COLOR_TEXT, 4, 2);
+#if CONFIG_UPLOAD_COLLECT_FIRST
+    // the second OTA slot holds the collect-first firmware
+    lv_label_set_text(p->title, "Board: collect");
+#else
     lv_label_set_text(p->title, "Board");
+#endif
     for (int i = 0; i < BOARD_ROWS; i++) {
         const int y = 30 + i * BOARD_ROW_H;
         p->names[i] = make_label(p->cont, &lv_font_montserrat_16, COLOR_DIM, 4, y);
@@ -517,6 +530,11 @@ static void hide_pages(void) {
 }
 
 
+static void refresh_timer_cb(lv_timer_t *timer) {
+    ui_refresh();
+}
+
+
 void ui_init(lv_display_t *disp) {
     lvgl_port_lock(0);
     lv_obj_t *scr = lv_display_get_screen_active(disp);
@@ -575,6 +593,8 @@ void ui_init(lv_display_t *disp) {
         m_ui.mode = UI_MODE_PICKER;
         jkbms_ble_set_discovery(true);
     }
+    // refreshed by the LVGL task itself: uploads on a slow network never hold the screen
+    lv_timer_create(refresh_timer_cb, UI_REFRESH_MS, NULL);
     lvgl_port_unlock();
 }
 
@@ -615,13 +635,9 @@ static void add_switch(setting_row_t *rows, int *count, const char *name, bool o
 /**
  * Lists the BMS settings, the ones relevant to discharge cut-offs first.
  */
-static int settings_rows(const jkbms_status_t *st, setting_row_t *rows) {
-    const jkbms_settings_t *s = &st->settings;
-    const bool is_32s = st->proto == JKBMS_PROTO_JK02_32S;
+static int settings_rows(jkbms_proto_t proto, const jkbms_settings_t *s, setting_row_t *rows) {
+    const bool is_32s = proto == JKBMS_PROTO_JK02_32S;
     int n = 0;
-    if (!st->settings_valid) {
-        return 0;
-    }
     add_switch(rows, &n, "Charge", s->charge_enabled);
     add_switch(rows, &n, "Discharge", s->discharge_enabled);
     add_switch(rows, &n, "Balancer", s->balancer_enabled);
@@ -663,9 +679,49 @@ static int settings_rows(const jkbms_status_t *st, setting_row_t *rows) {
 
 
 static int settings_pages(int bms) {
+    // the number of rows depends on the protocol only, not on the values
     static setting_row_t rows[SETTINGS_MAX];  // static: called under the LVGL lock only
-    const int n = settings_rows(&m_status[bms], rows);
+    static const jkbms_settings_t none;
+    const int n = settings_rows(m_status[bms].proto, &none, rows);
     return n > 0 ? (n + SETTINGS_ROWS - 1) / SETTINGS_ROWS : 1;
+}
+
+
+static const jkbms_extras_t* extras_of(int bms) {
+    return (m_extras != NULL && m_extras_bms == bms) ? m_extras : NULL;
+}
+
+
+/**
+ * Reads the settings or the logbook while their pages are shown, and frees
+ * them when another page is shown: memory is short.
+ */
+static void extras_for_page(int bms, page_kind_t kind) {
+    const bool wanted = kind == PAGE_SETTINGS || kind == PAGE_LOG;
+    if (m_extras != NULL && (!wanted || m_extras_bms != bms)) {
+        jkbms_ble_cancel_extras(m_extras);
+        free(m_extras);
+        m_extras = NULL;
+        m_extras_bms = -1;
+    }
+    if (!wanted) {
+        return;
+    }
+    if (m_extras == NULL) {
+        m_extras = calloc(1, sizeof(*m_extras));
+        if (m_extras == NULL) {
+            return;
+        }
+        m_extras_bms = bms;
+    }
+    // each is read once per visit; the BMS beeps on every request
+    const bool settings = kind == PAGE_SETTINGS && !m_extras->settings_valid && !m_extras->want_settings;
+    const bool logbook = kind == PAGE_LOG && !m_extras->logbook_valid && !m_extras->want_logbook;
+    if (settings || logbook) {
+        m_extras->want_settings |= settings;
+        m_extras->want_logbook |= logbook;
+        jkbms_ble_fetch_extras(bms, m_extras);
+    }
 }
 
 
@@ -683,9 +739,9 @@ static void format_age(uint32_t age, char *buf, size_t size) {
 /**
  * Formats logbook event n (0 = newest): its age and its description.
  */
-static void log_event_text(const jkbms_status_t *st, int n, char *time, size_t time_size, char *label,
-                           size_t label_size) {
-    const jkbms_log_entry_t *e = &st->logbook[st->logbook_count - 1 - n];
+static void log_event_text(const jkbms_status_t *st, const jkbms_extras_t *x, int n, char *time, size_t time_size,
+                           char *label, size_t label_size) {
+    const jkbms_log_entry_t *e = &x->logbook[x->logbook_count - 1 - n];
     // timestamps count seconds since the BMS was first powered, like its uptime
     const uint32_t now = jkbms_bms_now_s(st);
     format_age(now > e->timestamp_s ? now - e->timestamp_s : 0, time, time_size);
@@ -697,15 +753,16 @@ static void log_event_text(const jkbms_status_t *st, int n, char *time, size_t t
  * Splits the logbook, newest first, into pages of whole events.
  * `first` receives the index of the first event of every page.
  */
-static int log_paginate(const jkbms_status_t *st, uint8_t first[JKBMS_LOGBOOK_FRAME_ENTRIES]) {
+static int log_paginate(const jkbms_status_t *st, const jkbms_extras_t *x, uint8_t first[JKBMS_LOGBOOK_FRAME_ENTRIES]) {
     const int available = CONTENT_H - LOG_TITLE_H;
     int pages = 0;
     int used = available;
     int on_page = LOG_SLOTS;
     first[0] = 0;
-    for (int n = 0; n < st->logbook_count; n++) {
+    const int count = (x != NULL && x->logbook_valid) ? x->logbook_count : 0;
+    for (int n = 0; n < count; n++) {
         char time[32], label[64];
-        log_event_text(st, n, time, sizeof(time), label, sizeof(label));
+        log_event_text(st, x, n, time, sizeof(time), label, sizeof(label));
         lv_point_t size;
         lv_text_get_size(&size, label, &lv_font_montserrat_14, 0, 0, LCD_H_RES - 8, LV_TEXT_FLAG_NONE);
         const int height = LOG_TIME_H + size.y + LOG_GAP;
@@ -723,7 +780,7 @@ static int log_paginate(const jkbms_status_t *st, uint8_t first[JKBMS_LOGBOOK_FR
 
 static int log_pages(int bms) {
     uint8_t first[JKBMS_LOGBOOK_FRAME_ENTRIES];
-    return log_paginate(&m_status[bms], first);
+    return log_paginate(&m_status[bms], extras_of(bms), first);
 }
 
 
@@ -848,14 +905,9 @@ static void update_chart(const jkbms_status_t *st, int selected) {
     const jkbms_cell_info_t *ci = &st->cells;
     const int n = ci->cell_count;
     set_visible(m_ui.chart, true);
-    // fixed scale from the cell undervoltage to the overvoltage protection, so
-    // that the bars do not jump with every few mV of change
-    float lo = CHART_DEFAULT_LO;
-    float hi = CHART_DEFAULT_HI;
-    if (st->settings_valid && st->settings.cell_ovp > st->settings.cell_uvp) {
-        lo = st->settings.cell_uvp;
-        hi = st->settings.cell_ovp;
-    }
+    // fixed scale, so that the bars do not jump with every few mV of change
+    const float lo = CHART_DEFAULT_LO;
+    const float hi = CHART_DEFAULT_HI;
 
     const int gap = (n <= 16) ? 2 : 1;
     const int bar_w = (CHART_W - gap * (n - 1)) / n;
@@ -1010,9 +1062,10 @@ static void update_errors(const jkbms_status_t *st) {
 static void update_settings(const jkbms_status_t *st, int settings_page) {
     settings_page_t *p = &m_ui.settings;
     static setting_row_t rows[SETTINGS_MAX];  // static: called under the LVGL lock only
-    const int n = settings_rows(st, rows);
+    const jkbms_extras_t *x = extras_of(m_ui.bms);
+    const int n = (x != NULL && x->settings_valid) ? settings_rows(st->proto, &x->settings, rows) : 0;
     if (n == 0) {
-        lv_label_set_text(p->title, "Settings: loading...");
+        lv_label_set_text(p->title, "Settings: reading BMS...");
     } else {
         set_text(p->title, "Settings %d/%d", settings_page + 1, settings_pages(m_ui.bms));
     }
@@ -1034,10 +1087,11 @@ static void update_settings(const jkbms_status_t *st, int settings_page) {
 static void update_log(const jkbms_status_t *st, int log_page) {
     log_page_t *p = &m_ui.log;
     uint8_t first[JKBMS_LOGBOOK_FRAME_ENTRIES];
-    const int pages = log_paginate(st, first);
-    const int count = st->logbook_count;
-    if (!st->logbook_valid) {
-        lv_label_set_text(p->title, "Log: loading...");
+    const jkbms_extras_t *x = extras_of(m_ui.bms);
+    const int pages = log_paginate(st, x, first);
+    const int count = (x != NULL && x->logbook_valid) ? x->logbook_count : 0;
+    if (x == NULL || !x->logbook_valid) {
+        lv_label_set_text(p->title, "Log: reading BMS...");
     } else if (count == 0) {
         lv_label_set_text(p->title, "Log: empty");
     } else {
@@ -1054,7 +1108,7 @@ static void update_log(const jkbms_status_t *st, int log_page) {
             continue;
         }
         char time[32], label[64];
-        log_event_text(st, n, time, sizeof(time), label, sizeof(label));
+        log_event_text(st, x, n, time, sizeof(time), label, sizeof(label));
         lv_label_set_text(p->times[i], time);
         lv_label_set_text(p->events[i], label);
     }
@@ -1140,7 +1194,9 @@ static void ui_render(void) {
     update_header(st);
     update_wifi_icon();
     int index;
-    switch (page_kind(m_ui.bms, m_ui.page, &index)) {
+    const page_kind_t kind = page_kind(m_ui.bms, m_ui.page, &index);
+    extras_for_page(m_ui.bms, kind);
+    switch (kind) {
     case PAGE_SUMMARY:
         update_summary(st);
         set_visible(m_ui.summary.cont, true);
@@ -1218,11 +1274,6 @@ static void monitor_navigate(int step) {
     } else if (m_ui.page < 0) {
         step_bms(-1);
         m_ui.page = page_count(m_ui.bms) - 1;
-    }
-    int index;
-    if (page_kind(m_ui.bms, m_ui.page, &index) == PAGE_LOG && index == 0 && step > 0) {
-        // refresh the logbook whenever it is opened
-        jkbms_ble_request_logbook(m_ui.bms);
     }
 }
 
@@ -1511,12 +1562,16 @@ static void create_result_screen(void) {
 }
 
 
-void ui_show_upload_result(bool ok) {
+/**
+ * A check mark with `text` below it, or a cross without text.
+ */
+static void show_result(uint32_t rgb, bool ok, const lv_image_dsc_t *text, int64_t show_us) {
     lvgl_port_lock(0);
     if (m_ui.result_cont == NULL) {
         create_result_screen();
     }
-    const lv_color_t color = lv_color_hex(ok ? COLOR_OK : COLOR_ERROR);
+    const lv_color_t color = lv_color_hex(rgb);
+    lv_image_set_src(m_ui.result_text, text);
     // the cross has no text below it: centre it on the screen
     const int y = ok ? RESULT_Y : (LCD_V_RES - RESULT_RING_D) / 2;
     lv_obj_align(m_ui.result_ring, LV_ALIGN_TOP_MID, 0, y);
@@ -1528,8 +1583,18 @@ void ui_show_upload_result(bool ok) {
     set_visible(m_ui.result_cross[1], !ok);
     set_visible(m_ui.result_text, ok);
     set_visible(m_ui.result_cont, true);
-    m_ui.result_until_us = esp_timer_get_time() + RESULT_SHOW_US;
+    m_ui.result_until_us = esp_timer_get_time() + show_us;
     lvgl_port_unlock();
+}
+
+
+void ui_show_upload_result(bool ok) {
+    show_result(ok ? COLOR_OK : COLOR_ERROR, ok, &sent_text, RESULT_SHOW_US);
+}
+
+
+void ui_show_read_result(void) {
+    show_result(COLOR_READ, true, &read_text, READ_SHOW_US);
 }
 
 
@@ -1538,8 +1603,36 @@ static bool result_visible(void) {
 }
 
 
+/**
+ * A short text over everything for a few seconds.
+ */
+static void show_notice(const char *text) {
+    lv_obj_t *label = make_label(lv_layer_top(), &lv_font_montserrat_20, COLOR_TEXT, 0, 0);
+    lv_obj_set_width(label, LCD_H_RES);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_bg_color(label, lv_color_hex(COLOR_BG), 0);
+    lv_obj_set_style_bg_opa(label, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_ver(label, 20, 0);
+    lv_label_set_text(label, text);
+    lv_obj_center(label);
+    lv_obj_delete_delayed(label, 4000);
+}
+
+
 void ui_on_button(int step) {
-    lvgl_port_lock(0);
+    if (step == BUTTON_NEXT_LONG) {
+        // works with a stuck display too: the previous firmware is the way out
+        const char *error = remote_boot_previous();
+        if (lvgl_port_lock(500)) {
+            show_notice(error);
+            lvgl_port_unlock();
+        }
+        return;
+    }
+    // a stuck display must not block the buttons task, see BUTTON_NEXT_LONG
+    if (!lvgl_port_lock(500)) {
+        return;
+    }
     if (result_visible()) {
         // the press only closes the upload result
         set_visible(m_ui.result_cont, false);
@@ -1613,7 +1706,10 @@ static void create_ota_screen(void) {
 
 
 void ui_ota_progress(int percent) {
-    lvgl_port_lock(0);
+    // a firmware update must never wait for a stuck display
+    if (!lvgl_port_lock(100)) {
+        return;
+    }
     if (m_ui.ota_cont == NULL) {
         create_ota_screen();
     }

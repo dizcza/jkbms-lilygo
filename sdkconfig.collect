@@ -1,0 +1,2 @@
+# The collect-first variant in the second OTA slot, see tools/make_dual_image.sh
+CONFIG_UPLOAD_COLLECT_FIRST=y

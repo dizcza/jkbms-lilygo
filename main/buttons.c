@@ -17,6 +17,7 @@
 #define BUTTON_POLL_MS         10
 #define BUTTON_DEBOUNCE_MS     30
 #define BUTTON_LONG_MS         1500
+#define BUTTON_RIGHT_LONG_MS   5000
 
 
 static void buttons_task(void *args) {
@@ -50,6 +51,8 @@ static void buttons_task(void *args) {
             right_ms += BUTTON_POLL_MS;
             if (right_ms == BUTTON_DEBOUNCE_MS) {
                 callback(BUTTON_NEXT);
+            } else if (right_ms == BUTTON_RIGHT_LONG_MS) {
+                callback(BUTTON_NEXT_LONG);
             }
         } else {
             right_ms = 0;

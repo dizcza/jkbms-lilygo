@@ -30,8 +30,19 @@ menu "JK BMS status upload"
             endpoint URL, the API token and the Wi-Fi networks are build-time
             secrets, see main/CMakeLists.txt.
 
+    config UPLOAD_COLLECT_FIRST
+        bool "Read everything from the BMS first, send it later"
+        default n
+        help
+            For a BMS out of Wi-Fi reach: the status, the settings and the
+            whole logbook are read first ("Зчитано" shows for 5 s), and only
+            then sent, so that the board can be carried from the BMS to the
+            Wi-Fi router on a power bank. Built into the second OTA slot by
+            tools/make_dual_image.sh; the right button held for 5 s switches
+            between the two.
+
     config UPLOAD_EXTRAS_EVERY
-        int "Include the BMS settings and re-read the logbook every N uploads"
+        int "Re-read the BMS logbook for new events every N uploads"
         range 1 1000
         default 10
 

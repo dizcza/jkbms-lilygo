@@ -5,6 +5,11 @@ The T-Display board POSTs its status to /api/status every minute (bearer token
 auth). The dashboard at / (login required) loads /api/latest once; reload the
 page for fresh data.
 
+Remote maintenance (see manage.py): the reply to a status upload tells the
+board whether to POST its log to /api/logs, which log levels to use, a pending
+command, and the firmware to run, downloaded from /api/firmware
+(firmware/jkbms.bin). Logs go to logs/<device>.log.
+
 Environment:
     JKBMS_API_TOKEN     token the board sends in the Authorization header
     JKBMS_WEB_USER      dashboard login
@@ -17,11 +22,12 @@ import functools
 import hmac
 import json
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
 
-from flask import Flask, abort, g, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, abort, g, jsonify, redirect, render_template, request, send_file, session, url_for
 
 HISTORY_DAYS = 90
 OFFLINE_AFTER_S = 180   # three missed uploads
@@ -31,7 +37,13 @@ app.secret_key = os.environ["SECRET_KEY"]
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.permanent_session_lifetime = 30 * 86400
 
-DB_PATH = os.environ.get("JKBMS_DB", str(Path(__file__).with_name("jkbms.sqlite3")))
+HERE = Path(__file__).parent
+DB_PATH = os.environ.get("JKBMS_DB", str(HERE / "jkbms.sqlite3"))
+FIRMWARE_PATH = HERE / "firmware" / "jkbms.bin"
+LOGS_DIR = HERE / "logs"
+LOG_MAX_BYTES = 20 * 1024 * 1024
+ANSI_RE = re.compile(rb"\x1b\[[0-9;]*m")
+DEFAULT_CONFIG = {"logs": "0", "ota": "0", "log_level": "{}"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS latest (
@@ -68,6 +80,18 @@ CREATE TABLE IF NOT EXISTS devices (
     received REAL,
     wake INTEGER
 );
+CREATE TABLE IF NOT EXISTS commands (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device TEXT,
+    payload TEXT,
+    created REAL
+);
+CREATE TABLE IF NOT EXISTS config (
+    device TEXT,
+    key TEXT,
+    value TEXT,
+    PRIMARY KEY (device, key)
+);
 """
 
 
@@ -87,6 +111,61 @@ def close_db(exc):
 
 with app.app_context():
     db().executescript(SCHEMA)
+    # added with remote maintenance: the board's firmware and diagnostics
+    columns = [r["name"] for r in db().execute("PRAGMA table_info(devices)")]
+    if "board" not in columns:
+        db().execute("ALTER TABLE devices ADD COLUMN board TEXT")
+        db().commit()
+
+
+def get_config(conn, device):
+    """Settings of a board: its own rows over the "*" rows over DEFAULT_CONFIG."""
+    config = dict(DEFAULT_CONFIG)
+    for row in conn.execute("SELECT key, value FROM config WHERE device = '*'"):
+        config[row["key"]] = row["value"]
+    for row in conn.execute("SELECT key, value FROM config WHERE device = ?", (device,)):
+        config[row["key"]] = row["value"]
+    return config
+
+
+def firmware_elf():
+    """SHA-256 of the ELF of firmware/jkbms.bin, from its app description, or None."""
+    try:
+        with open(FIRMWARE_PATH, "rb") as f:
+            # image header (24) + segment header (8) + esp_app_desc_t up to app_elf_sha256 (144)
+            head = f.read(24 + 8 + 144 + 32)
+    except FileNotFoundError:
+        return None
+    if len(head) < 208 or head[0] != 0xE9 or int.from_bytes(head[32:36], "little") != 0xABCD5432:
+        return None
+    return head[176:208].hex()
+
+
+def check_token():
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ")
+    if not hmac.compare_digest(token, os.environ["JKBMS_API_TOKEN"]):
+        abort(401)
+
+
+def board_reply(conn, device, data):
+    """What the board should do next; boards without "fw" ignore the reply."""
+    reply = {"ok": True}
+    config = get_config(conn, device)
+    reply["logs"] = config["logs"] == "1"
+    try:
+        reply["log_level"] = json.loads(config["log_level"])
+    except ValueError:
+        pass
+    done = (data.get("diag") or {}).get("cmd_id", 0)
+    row = conn.execute("SELECT id, payload FROM commands WHERE device = ? AND id > ? ORDER BY id LIMIT 1",
+                       (device, done)).fetchone()
+    if row:
+        reply["cmd"] = {**json.loads(row["payload"]), "id": row["id"]}
+    elf = firmware_elf()
+    fw = data.get("fw") or {}
+    if config["ota"] == "1" and elf and fw.get("elf") and fw["elf"] != elf:
+        reply["ota"] = {"elf": elf, "url": "firmware"}
+    return reply
 
 
 def login_required(view):
@@ -128,23 +207,89 @@ def dashboard():
 
 @app.post("/api/status")
 def post_status():
-    token = request.headers.get("Authorization", "").removeprefix("Bearer ")
-    if not hmac.compare_digest(token, os.environ["JKBMS_API_TOKEN"]):
-        abort(401)
+    check_token()
     data = request.get_json(force=True)
     now = time.time()
     conn = db()
     device = data.get("device", "")
-    conn.execute("INSERT OR REPLACE INTO devices (device, received, wake) VALUES (?, ?, ?)",
-                 (device, now, data.get("wake")))
+    part = data.get("part")
+    if part:
+        # the board sends the settings and the logbook in separate small reports
+        conn.execute("UPDATE devices SET received = ? WHERE device = ?", (now, device))
+        for bms in data.get("bms", []):
+            store_part(conn, bms, now)
+        conn.commit()
+        return {"ok": True}
+    board = {key: data[key] for key in ("fw", "diag") if key in data}
+    conn.execute("INSERT OR REPLACE INTO devices (device, received, wake, board) VALUES (?, ?, ?, ?)",
+                 (device, now, data.get("wake"), json.dumps(board)))
+    # a board out of Wi-Fi reach sends what it read earlier, with its age in seconds
+    measured = now - float(data.get("age") or 0)
     for bms in data.get("bms", []):
-        store_bms(conn, device, bms, now)
+        store_bms(conn, device, bms, now, measured)
     conn.execute("DELETE FROM history WHERE ts < ?", (now - HISTORY_DAYS * 86400,))
+    reply = board_reply(conn, device, data)
     conn.commit()
+    return reply
+
+
+@app.post("/api/logs")
+def post_logs():
+    """Log output of a board, appended to logs/<device>.log."""
+    check_token()
+    device = request.args.get("device", "")
+    if not re.fullmatch(r"[0-9A-F]{12}", device):
+        abort(400)
+    LOGS_DIR.mkdir(exist_ok=True)
+    path = LOGS_DIR / f"{device}.log"
+    if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
+        path.replace(path.with_suffix(".log.1"))
+    text = ANSI_RE.sub(b"", request.get_data())
+    lost = request.args.get("lost", "0")
+    header = f"===== received {time.strftime('%Y-%m-%d %H:%M:%S')}"
+    if lost != "0":
+        header += f", {lost} bytes lost"
+    with open(path, "ab") as f:
+        f.write(f"{header} =====\n".encode())
+        f.write(text)
+        if not text.endswith(b"\n"):
+            f.write(b"\n")
     return {"ok": True}
 
 
-def store_bms(conn, device, bms, now):
+@app.get("/api/firmware")
+def get_firmware():
+    check_token()
+    if not FIRMWARE_PATH.exists():
+        abort(404)
+    return send_file(FIRMWARE_PATH, mimetype="application/octet-stream")
+
+
+def store_part(conn, bms, now):
+    """Settings or logbook events of a BMS, merged into what is known of it."""
+    mac = bms["mac"]
+    row = conn.execute("SELECT payload FROM latest WHERE mac = ?", (mac,)).fetchone()
+    if "settings" in bms and row:
+        payload = json.loads(row["payload"])
+        payload["settings"] = bms["settings"]
+        conn.execute("UPDATE latest SET payload = ? WHERE mac = ?", (json.dumps(payload), mac))
+    if bms.get("logbook"):
+        store_events(conn, mac, bms["logbook"], now)
+
+
+def store_events(conn, mac, logbook, now):
+    # event timestamps count seconds of BMS uptime; convert them to wall clock
+    uptime = logbook["uptime"]
+    total = logbook["total"]
+    events = logbook["events"]
+    for i, (ts, code, label) in enumerate(events):
+        number = total - (len(events) - 1 - i)
+        conn.execute("INSERT OR IGNORE INTO events (mac, number, ts, code, label) VALUES (?, ?, ?, ?, ?)",
+                     (mac, number, now - (uptime - ts), code, label))
+
+
+def store_bms(conn, device, bms, now, measured):
+    """`now` is when the report arrived, `measured` when the board read the BMS."""
     mac = bms["mac"]
     row = conn.execute("SELECT payload FROM latest WHERE mac = ?", (mac,)).fetchone()
     previous = json.loads(row["payload"]) if row else {}
@@ -156,7 +301,7 @@ def store_bms(conn, device, bms, now):
     if not bms.get("online") and "cells" not in bms and "cells" in previous:
         # BMS not reachable this time: keep the last known values, flagged offline
         bms = {**previous, "online": False, "error": bms.get("error")}
-    bms["updated"] = now if bms.get("online") else previous.get("updated")
+    bms["updated"] = measured if bms.get("online") else previous.get("updated")
     conn.execute("INSERT OR REPLACE INTO latest (mac, device, received, payload) VALUES (?, ?, ?, ?)",
                  (mac, device, now, json.dumps(bms)))
 
@@ -164,18 +309,11 @@ def store_bms(conn, device, bms, now):
         conn.execute(
             "INSERT INTO history (mac, ts, voltage, current, soc, min_cell, max_cell, charging, discharging, errors,"
             " cells) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (mac, now, bms["voltage"], bms["current"], bms["soc"], min(bms["cells"]), max(bms["cells"]),
+            (mac, measured, bms["voltage"], bms["current"], bms["soc"], min(bms["cells"]), max(bms["cells"]),
              bms["charging"], bms["discharging"], bms["errors"], json.dumps(bms["cells"])))
 
     if new_logbook:
-        # event timestamps count seconds of BMS uptime; convert them to wall clock
-        uptime = new_logbook["uptime"]
-        total = new_logbook["total"]
-        events = new_logbook["events"]
-        for i, (ts, code, label) in enumerate(events):
-            number = total - (len(events) - 1 - i)
-            conn.execute("INSERT OR IGNORE INTO events (mac, number, ts, code, label) VALUES (?, ?, ?, ?, ?)",
-                         (mac, number, now - (uptime - ts), code, label))
+        store_events(conn, mac, new_logbook, now)
 
 
 @app.get("/api/latest")
@@ -192,7 +330,11 @@ def get_latest():
             "SELECT number, ts, code, label FROM events WHERE mac = ? ORDER BY number DESC LIMIT 500",
             (row["mac"],))]
         result.append(bms)
-    devices = [dict(d) for d in conn.execute("SELECT * FROM devices")]
+    devices = []
+    for row in conn.execute("SELECT * FROM devices ORDER BY received DESC"):
+        device = dict(row)
+        device.update(json.loads(device.pop("board") or "{}"))
+        devices.append(device)
     return jsonify({"now": now, "bms": result, "devices": devices})
 
 

@@ -15,6 +15,7 @@
 #define BUTTON_PREV        (-1)    // left button, short press (fires on release)
 #define BUTTON_NEXT        (+1)    // right button press
 #define BUTTON_PREV_LONG   (-2)    // left button held for 1.5 s
+#define BUTTON_NEXT_LONG   (+2)    // right button held for 5 s: back to the previous firmware
 
 /**
  * Called from the buttons task with one of the BUTTON_* events.
