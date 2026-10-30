@@ -34,8 +34,8 @@ esp_err_t webserver_start(void);
 bool webserver_ota_active(void);
 
 /**
- * Takes the right to write a firmware, so that a web upload and a download
- * from the dashboard (remote.c) never run at once. False when taken.
+ * Takes the right to write a firmware, so that two uploads never run at once,
+ * and turns Bluetooth off for the update. False when taken.
  */
 bool webserver_ota_claim(void);
 

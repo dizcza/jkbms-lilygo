@@ -39,6 +39,13 @@ void ui_show_upload_result(bool ok);
 void ui_show_read_result(void);
 
 /**
+ * Progress of sending the data to the dashboard (of reading it from the BMS
+ * with CONFIG_UPLOAD_COLLECT_FIRST) in permille, shown in the header in place
+ * of its usual content; -1 to show the usual content.
+ */
+void ui_set_send_progress(int permille);
+
+/**
  * Shows the firmware update progress over everything, 0..100 %.
  * A negative value hides it.
  */

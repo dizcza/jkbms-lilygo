@@ -55,6 +55,11 @@
 #define SPINNER_SIZE      100
 
 #define UI_REFRESH_MS     500
+#if CONFIG_UPLOAD_COLLECT_FIRST
+#define CONFIG_UPLOAD_COLLECT_FIRST_ENABLED  true
+#else
+#define CONFIG_UPLOAD_COLLECT_FIRST_ENABLED  false
+#endif
 #define RESULT_SHOW_US    (7 * 1000000LL)   // the first-upload check mark or cross
 #define READ_SHOW_US      (5 * 1000000LL)   // the yellow "read" check mark
 #define RESULT_RING_D     104
@@ -72,7 +77,7 @@
 
 #define SETTINGS_ROWS     4          // settings per page, name and value on two lines
 #define SETTINGS_ROW_H    47
-#define SETTINGS_MAX      32
+#define SETTINGS_MAX      48
 
 #define BOARD_ROWS        3          // firmware, Wi-Fi, update address
 #define BOARD_ROW_H       62
@@ -190,6 +195,7 @@ static struct {
     lv_obj_t *header_state;
     lv_obj_t *header_wifi;
     lv_obj_t *header_wifi_cross;
+    lv_obj_t *header_bar;    // sending progress, in place of the title, the dot and the Wi-Fi icon
     summary_page_t summary;
     pack_page_t pack;
     cells_page_t cells;
@@ -565,6 +571,14 @@ void ui_init(lv_display_t *disp) {
     lv_obj_set_style_line_width(m_ui.header_wifi_cross, 2, 0);
     lv_obj_set_style_line_color(m_ui.header_wifi_cross, lv_color_hex(COLOR_ERROR), 0);
     lv_obj_set_style_line_rounded(m_ui.header_wifi_cross, true, 0);
+    m_ui.header_bar = lv_bar_create(header);
+    lv_obj_set_size(m_ui.header_bar, LCD_H_RES - 12, 10);
+    lv_obj_center(m_ui.header_bar);
+    lv_bar_set_range(m_ui.header_bar, 0, 1000);
+    lv_obj_set_style_bg_color(m_ui.header_bar, lv_color_hex(COLOR_BG), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(m_ui.header_bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(m_ui.header_bar, lv_color_hex(COLOR_OK), LV_PART_INDICATOR);
+    set_visible(m_ui.header_bar, false);
 
     create_summary_page(scr);
     create_pack_page(scr);
@@ -661,7 +675,13 @@ static int settings_rows(jkbms_proto_t proto, const jkbms_settings_t *s, setting
     add_row(rows, &n, COLOR_TEXT, "Bal trigger", "%.0f mV", s->balance_trigger * 1000);
     add_row(rows, &n, COLOR_TEXT, "Bal max", "%.1f A", s->max_balance_current);
     add_row(rows, &n, COLOR_TEXT, "Chg max", "%.0f A", s->max_charge_current);
+    add_row(rows, &n, COLOR_TEXT, "Chg OCP delay", "%lu s", (unsigned long) s->charge_ocp_delay_s);
+    add_row(rows, &n, COLOR_TEXT, "Chg OCP rec", "%lu s", (unsigned long) s->charge_ocp_recovery_s);
     add_row(rows, &n, COLOR_TEXT, "Dsg max", "%.0f A", s->max_discharge_current);
+    add_row(rows, &n, COLOR_TEXT, "Dsg OCP delay", "%lu s", (unsigned long) s->discharge_ocp_delay_s);
+    add_row(rows, &n, COLOR_TEXT, "Dsg OCP rec", "%lu s", (unsigned long) s->discharge_ocp_recovery_s);
+    add_row(rows, &n, COLOR_TEXT, "SCP delay", "%lu us", (unsigned long) s->scp_delay_us);
+    add_row(rows, &n, COLOR_TEXT, "SCP rec", "%lu s", (unsigned long) s->scp_recovery_s);
     add_row(rows, &n, COLOR_TEXT, "Chg OTP", "%.0f/%.0f" "\xC2\xB0" "C", s->charge_otp, s->charge_otp_recovery);
     add_row(rows, &n, COLOR_TEXT, "Chg UTP", "%.0f/%.0f" "\xC2\xB0" "C", s->charge_utp, s->charge_utp_recovery);
     add_row(rows, &n, COLOR_TEXT, "Dsg OTP", "%.0f/%.0f" "\xC2\xB0" "C", s->discharge_otp,
@@ -673,6 +693,10 @@ static int settings_rows(jkbms_proto_t proto, const jkbms_settings_t *s, setting
     add_row(rows, &n, COLOR_TEXT, "MOS OTP", "%.0f/%.0f" "\xC2\xB0" "C", s->mosfet_otp, s->mosfet_otp_recovery);
     if (is_32s) {
         add_row(rows, &n, COLOR_TEXT, "Heating", "%s", s->heating_enabled ? "ON" : "OFF");
+        add_row(rows, &n, COLOR_TEXT, "RCV / RFV", "%.2f/%.2f V", s->cell_rcv, s->cell_rfv);
+        add_row(rows, &n, COLOR_TEXT, "Stored data", "%s", s->timed_stored_data ? "ON" : "OFF");
+        add_row(rows, &n, COLOR_TEXT, "Float mode", "%s", s->charging_float_mode ? "ON" : "OFF");
+        add_row(rows, &n, COLOR_TEXT, "Precharge", "%u s", s->precharge_s);
     }
     return n;
 }
@@ -867,6 +891,34 @@ static void update_wifi_icon(void) {
 }
 
 
+static volatile int m_send_permille = -1;
+
+
+void ui_set_send_progress(int permille) {
+    m_send_permille = permille;
+}
+
+
+/**
+ * The progress replaces the title, the state dot and the Wi-Fi icon: of
+ * sending, while the data goes out over Wi-Fi from a connected BMS, or, on a
+ * collect-first board, of reading the BMS, which needs no Wi-Fi.
+ */
+static bool show_send_progress(const jkbms_status_t *st) {
+    const int permille = m_send_permille;
+    const bool show = permille >= 0
+            && (CONFIG_UPLOAD_COLLECT_FIRST_ENABLED || (st->link == JKBMS_LINK_STREAMING && uploader_connected()));
+    set_visible(m_ui.header_bar, show);
+    set_visible(m_ui.header_title, !show);
+    set_visible(m_ui.header_wifi, !show);
+    if (show) {
+        lv_bar_set_value(m_ui.header_bar, permille, LV_ANIM_OFF);
+        set_visible(m_ui.header_state, false);
+    }
+    return show;
+}
+
+
 static void update_header(const jkbms_status_t *st) {
     // green: data was read (the BMS is read once per wakeup), red: connection
     // error, orange: no data yet
@@ -879,7 +931,7 @@ static void update_header(const jkbms_status_t *st) {
     set_text(m_ui.header_title, "BMS %d", m_ui.bms + 1);
     lv_obj_align(m_ui.header_title, LV_ALIGN_LEFT_MID, 6, 0);
     lv_obj_set_style_bg_color(m_ui.header_state, lv_color_hex(color), 0);
-    set_visible(m_ui.header_state, true);
+    set_visible(m_ui.header_state, !show_send_progress(st));
 
     bool alarm = false;
     for (int i = 0; i < JKBMS_DEVICES_MAX; i++) {
@@ -1435,6 +1487,9 @@ static void picker_render(void) {
     hide_pages();
     set_visible(p->cont, true);
     set_visible(m_ui.header_state, false);
+    set_visible(m_ui.header_bar, false);
+    set_visible(m_ui.header_title, true);
+    set_visible(m_ui.header_wifi, true);
 
     const int items = picker_items();
     const bool show_list = !picker_scanning() && items > 0;

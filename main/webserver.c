@@ -32,7 +32,7 @@
 extern const char *const build_time;   // generated, see main/build_time.cmake
 
 static const char *TAG = "web";
-static bool m_ota_active;               // a firmware is being written, from here or by remote.c
+static bool m_ota_active;               // a firmware is being written
 static portMUX_TYPE m_ota_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile size_t m_ota_received;  // bytes written so far, for /progress
 static volatile size_t m_ota_total;

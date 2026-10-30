@@ -3,12 +3,9 @@ JK BMS status endpoint and dashboard.
 
 The T-Display board POSTs its status to /api/status every minute (bearer token
 auth). The dashboard at / (login required) loads /api/latest once; reload the
-page for fresh data.
-
-Remote maintenance (see manage.py): the reply to a status upload tells the
-board whether to POST its log to /api/logs, which log levels to use, a pending
-command, and the firmware to run, downloaded from /api/firmware
-(firmware/jkbms.bin). Logs go to logs/<device>.log.
+page for fresh data. The board's firmware and diagnostics come with each
+status report (see manage.py status); the firmware is updated only on the
+board's own update page, the dashboard sends the board no commands.
 
 Environment:
     JKBMS_API_TOKEN     token the board sends in the Authorization header
@@ -22,12 +19,11 @@ import functools
 import hmac
 import json
 import os
-import re
 import sqlite3
 import time
 from pathlib import Path
 
-from flask import Flask, abort, g, jsonify, redirect, render_template, request, send_file, session, url_for
+from flask import Flask, abort, g, jsonify, redirect, render_template, request, session, url_for
 
 HISTORY_DAYS = 90
 OFFLINE_AFTER_S = 180   # three missed uploads
@@ -39,11 +35,6 @@ app.permanent_session_lifetime = 30 * 86400
 
 HERE = Path(__file__).parent
 DB_PATH = os.environ.get("JKBMS_DB", str(HERE / "jkbms.sqlite3"))
-FIRMWARE_PATH = HERE / "firmware" / "jkbms.bin"
-LOGS_DIR = HERE / "logs"
-LOG_MAX_BYTES = 20 * 1024 * 1024
-ANSI_RE = re.compile(rb"\x1b\[[0-9;]*m")
-DEFAULT_CONFIG = {"logs": "0", "ota": "0", "log_level": "{}"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS latest (
@@ -80,18 +71,6 @@ CREATE TABLE IF NOT EXISTS devices (
     received REAL,
     wake INTEGER
 );
-CREATE TABLE IF NOT EXISTS commands (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    device TEXT,
-    payload TEXT,
-    created REAL
-);
-CREATE TABLE IF NOT EXISTS config (
-    device TEXT,
-    key TEXT,
-    value TEXT,
-    PRIMARY KEY (device, key)
-);
 """
 
 
@@ -118,54 +97,10 @@ with app.app_context():
         db().commit()
 
 
-def get_config(conn, device):
-    """Settings of a board: its own rows over the "*" rows over DEFAULT_CONFIG."""
-    config = dict(DEFAULT_CONFIG)
-    for row in conn.execute("SELECT key, value FROM config WHERE device = '*'"):
-        config[row["key"]] = row["value"]
-    for row in conn.execute("SELECT key, value FROM config WHERE device = ?", (device,)):
-        config[row["key"]] = row["value"]
-    return config
-
-
-def firmware_elf():
-    """SHA-256 of the ELF of firmware/jkbms.bin, from its app description, or None."""
-    try:
-        with open(FIRMWARE_PATH, "rb") as f:
-            # image header (24) + segment header (8) + esp_app_desc_t up to app_elf_sha256 (144)
-            head = f.read(24 + 8 + 144 + 32)
-    except FileNotFoundError:
-        return None
-    if len(head) < 208 or head[0] != 0xE9 or int.from_bytes(head[32:36], "little") != 0xABCD5432:
-        return None
-    return head[176:208].hex()
-
-
 def check_token():
     token = request.headers.get("Authorization", "").removeprefix("Bearer ")
     if not hmac.compare_digest(token, os.environ["JKBMS_API_TOKEN"]):
         abort(401)
-
-
-def board_reply(conn, device, data):
-    """What the board should do next; boards without "fw" ignore the reply."""
-    reply = {"ok": True}
-    config = get_config(conn, device)
-    reply["logs"] = config["logs"] == "1"
-    try:
-        reply["log_level"] = json.loads(config["log_level"])
-    except ValueError:
-        pass
-    done = (data.get("diag") or {}).get("cmd_id", 0)
-    row = conn.execute("SELECT id, payload FROM commands WHERE device = ? AND id > ? ORDER BY id LIMIT 1",
-                       (device, done)).fetchone()
-    if row:
-        reply["cmd"] = {**json.loads(row["payload"]), "id": row["id"]}
-    elf = firmware_elf()
-    fw = data.get("fw") or {}
-    if config["ota"] == "1" and elf and fw.get("elf") and fw["elf"] != elf:
-        reply["ota"] = {"elf": elf, "url": "firmware"}
-    return reply
 
 
 def login_required(view):
@@ -228,41 +163,8 @@ def post_status():
     for bms in data.get("bms", []):
         store_bms(conn, device, bms, now, measured)
     conn.execute("DELETE FROM history WHERE ts < ?", (now - HISTORY_DAYS * 86400,))
-    reply = board_reply(conn, device, data)
     conn.commit()
-    return reply
-
-
-@app.post("/api/logs")
-def post_logs():
-    """Log output of a board, appended to logs/<device>.log."""
-    check_token()
-    device = request.args.get("device", "")
-    if not re.fullmatch(r"[0-9A-F]{12}", device):
-        abort(400)
-    LOGS_DIR.mkdir(exist_ok=True)
-    path = LOGS_DIR / f"{device}.log"
-    if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
-        path.replace(path.with_suffix(".log.1"))
-    text = ANSI_RE.sub(b"", request.get_data())
-    lost = request.args.get("lost", "0")
-    header = f"===== received {time.strftime('%Y-%m-%d %H:%M:%S')}"
-    if lost != "0":
-        header += f", {lost} bytes lost"
-    with open(path, "ab") as f:
-        f.write(f"{header} =====\n".encode())
-        f.write(text)
-        if not text.endswith(b"\n"):
-            f.write(b"\n")
     return {"ok": True}
-
-
-@app.get("/api/firmware")
-def get_firmware():
-    check_token()
-    if not FIRMWARE_PATH.exists():
-        abort(404)
-    return send_file(FIRMWARE_PATH, mimetype="application/octet-stream")
 
 
 def store_part(conn, bms, now):

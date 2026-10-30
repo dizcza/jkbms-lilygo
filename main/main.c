@@ -19,6 +19,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <sys/param.h>
 
 #include "buttons.h"
 #include "console.h"
@@ -36,7 +37,6 @@
 #define PART_RETRY_US         (30 * 1000000LL)  // a failed settings or logbook report is sent again
 #define READ_SHOW_US          (5 * 1000000LL)   // "read" shows this long before sending starts
 #define FALLBACK_PERIOD_US    ((CONFIG_UPLOAD_PERIOD_S + 60) * 1000000LL)
-#define REPLY_SIZE            1024
 
 static const char *TAG = "main";
 
@@ -105,15 +105,14 @@ static bool selection_changed(void) {
 
 
 /**
- * Builds and POSTs the status report and acts on the dashboard's reply.
+ * Builds and POSTs the status report.
  * Returns ESP_ERR_NOT_FINISHED when skipped during a firmware update.
  */
 static esp_err_t post_status(const char *json) {
-    static char reply[REPLY_SIZE];
-    const esp_err_t err = uploader_send(json, reply, sizeof(reply));
+    // the dashboard's reply carries no commands: it is not read
+    const esp_err_t err = uploader_send(json, NULL, 0);
     if (err == ESP_OK) {
         mark_app_valid();
-        remote_on_reply(reply);
     }
     return err;
 }
@@ -123,7 +122,7 @@ static uint32_t m_uploads;
 
 
 static esp_err_t upload(void) {
-    if (webserver_ota_active() || remote_ota_active()) {
+    if (webserver_ota_active()) {
         ESP_LOGI(TAG, "Firmware update in progress, upload skipped");
         return ESP_ERR_NOT_FINISHED;
     }
@@ -147,7 +146,7 @@ static esp_err_t upload_part(char *json) {
     if (json == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    if (webserver_ota_active() || remote_ota_active()) {
+    if (webserver_ota_active()) {
         free(json);
         return ESP_ERR_NOT_FINISHED;
     }
@@ -235,11 +234,58 @@ static void show_result(bool ok) {
 }
 
 
+// the header progress: a third for the status, a third for the settings, a third for the logbook,
+// sent (or, collecting first, read from the BMS)
+#define PROGRESS_SETTINGS   333
+#define PROGRESS_LOGBOOK    667
+#define PROGRESS_FULL       1000
+#define LOGBOOK_CHUNK       10
+
+static int m_logbook_chunks;            // logbook reports of this round: for the progress
+
+
+static void show_progress(void) {
+    int permille = -1;
+#if CONFIG_UPLOAD_COLLECT_FIRST
+    // how much was read from the BMS: the status (its stream runs), the settings, the logbook
+    if (m_stage == STAGE_COLLECT) {
+        permille = (m_extras != NULL ? PROGRESS_SETTINGS : 0)
+                 + (m_extras != NULL && m_extras->settings_valid ? PROGRESS_LOGBOOK - PROGRESS_SETTINGS : 0)
+                 + (m_extras != NULL && m_extras->logbook_valid ? PROGRESS_FULL - PROGRESS_LOGBOOK : 0);
+    }
+    ui_set_send_progress(permille);
+    return;
+#endif
+    switch (m_stage) {
+    case STAGE_READ_STATUS:
+    case STAGE_STATUS:
+        permille = 0;
+        break;
+    case STAGE_SETTINGS:
+        permille = PROGRESS_SETTINGS;
+        break;
+    case STAGE_LOGBOOK: {
+        // the last third fills with every logbook report
+        const int left = (m_extras != NULL && m_extras->logbook_valid)
+                ? (report_logbook_unsent(m_extras_slot, m_extras) + LOGBOOK_CHUNK - 1) / LOGBOOK_CHUNK : 1;
+        const int total = MAX(m_logbook_chunks, left);
+        permille = PROGRESS_LOGBOOK + (total > 0 ? (PROGRESS_FULL - PROGRESS_LOGBOOK) * (total - left) / total : 0);
+        break;
+    }
+    default:
+        break;
+    }
+    ui_set_send_progress(permille);
+}
+
+
 /**
  * Sends the logbook events not delivered yet. True when all are delivered.
  */
 static bool send_logbook(void) {
+    m_logbook_chunks = (report_logbook_unsent(m_extras_slot, m_extras) + LOGBOOK_CHUNK - 1) / LOGBOOK_CHUNK;
     while (1) {
+        show_progress();
         char *json = report_build_logbook(m_extras_slot, m_extras);
         if (json == NULL) {
             return true;  // nothing new left (or no memory: the next round tries again)
@@ -379,6 +425,7 @@ void app_main(void) {
         if (m_stage < STAGE_STATUS) {
             // collect first: nothing goes out until everything was read
             stages_run(now);
+            show_progress();
             continue;
         }
         if (stream_started() && due_us < 0) {
@@ -412,5 +459,6 @@ void app_main(void) {
             last_upload_us = now;
         }
         stages_run(now);
+        show_progress();
     }
 }

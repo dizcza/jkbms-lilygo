@@ -121,6 +121,28 @@ typedef struct {
     bool heating_enabled;           // JK02_32S
     bool smart_sleep_enabled;       // JK02_32S
     uint8_t smart_sleep_delay_h;    // JK02_32S
+    float cell_rcv;                 // V, request charge voltage
+    float cell_rfv;                 // V, request float voltage
+    uint32_t charge_ocp_delay_s;    // overcurrent tolerated this long before the protection trips
+    uint32_t charge_ocp_recovery_s;
+    uint32_t discharge_ocp_delay_s;
+    uint32_t discharge_ocp_recovery_s;
+    uint32_t scp_delay_us;          // short circuit protection
+    uint32_t scp_recovery_s;
+    uint8_t wire_count;             // entries in wire_resistance_mohm
+    uint16_t wire_resistance_mohm[JKBMS_MAX_CELLS];  // balance lead calibration per cell
+    uint8_t device_address;         // JK02_32S
+    uint8_t precharge_s;            // JK02_32S
+    int8_t heating_start;           // °C, JK02_32S
+    int8_t heating_stop;            // °C, JK02_32S
+    bool disable_temp_sensors;      // JK02_32S
+    bool gps_heartbeat;             // JK02_32S
+    bool port_rs485;                // JK02_32S, else CAN
+    bool display_always_on;         // JK02_32S
+    bool special_charger;           // JK02_32S
+    bool disable_pcl_module;        // JK02_32S
+    bool timed_stored_data;         // JK02_32S
+    bool charging_float_mode;       // JK02_32S
 } jkbms_settings_t;
 
 

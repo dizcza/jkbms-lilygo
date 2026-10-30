@@ -51,6 +51,10 @@ function renderCells(bms) {
   }).join("");
 }
 
+function onOffText(value) {
+  return value === undefined ? "–" : (value ? "ON" : "OFF");
+}
+
 function renderSettings(settings) {
   if (!settings) return '<p class="dim">Not received yet.</p>';
   const rows = [
@@ -71,10 +75,30 @@ function renderSettings(settings) {
     ["Max balance current", fmt(settings.max_balance_current, 1, " A")],
     ["Max charge / discharge", `${fmt(settings.max_charge_current, 0, "")} / ` +
                                `${fmt(settings.max_discharge_current, 0, " A")}`],
-    ["Charge OTP / UTP", `${settings.charge_otp} / ${settings.charge_utp} °C`],
-    ["Discharge OTP / UTP", `${settings.discharge_otp} / ${settings.discharge_utp} °C`],
-    ["MOSFET OTP", `${settings.mosfet_otp} °C`],
-    ["Heating", settings.heating_enabled ? "ON" : "OFF"],
+    ["Charge OCP delay / recovery", `${settings.charge_ocp_delay ?? "–"} / ${settings.charge_ocp_recovery ?? "–"} s`],
+    ["Discharge OCP delay / recovery",
+     `${settings.discharge_ocp_delay ?? "–"} / ${settings.discharge_ocp_recovery ?? "–"} s`],
+    ["Short circuit delay / recovery", `${settings.scp_delay_us ?? "–"} µs / ${settings.scp_recovery ?? "–"} s`],
+    ["Request charge / float voltage", `${fmt(settings.cell_rcv, 3, "")} / ${fmt(settings.cell_rfv, 3, " V")}`],
+    ["Charge OTP / recovery", `${settings.charge_otp} / ${settings.charge_otp_recovery ?? "–"} °C`],
+    ["Charge UTP / recovery", `${settings.charge_utp} / ${settings.charge_utp_recovery ?? "–"} °C`],
+    ["Discharge OTP / recovery", `${settings.discharge_otp} / ${settings.discharge_otp_recovery ?? "–"} °C`],
+    ["Discharge UTP / recovery", `${settings.discharge_utp} / ${settings.discharge_utp_recovery ?? "–"} °C`],
+    ["MOSFET OTP / recovery", `${settings.mosfet_otp} / ${settings.mosfet_otp_recovery ?? "–"} °C`],
+    ["Heating", `${settings.heating_enabled ? "ON" : "OFF"}` +
+                (settings.heating_start !== undefined ? `, ${settings.heating_start}…${settings.heating_stop} °C` : "")],
+    ["Timed stored data", onOffText(settings.timed_stored_data)],
+    ["Charging float mode", onOffText(settings.charging_float_mode)],
+    ["Special charger", onOffText(settings.special_charger)],
+    ["Display always on", onOffText(settings.display_always_on)],
+    ["Temperature sensors disabled", onOffText(settings.disable_temp_sensors)],
+    ["Disable PCL module", onOffText(settings.disable_pcl_module)],
+    ["GPS heartbeat", onOffText(settings.gps_heartbeat)],
+    ["Port", settings.port_rs485 === undefined ? "–" : (settings.port_rs485 ? "RS485" : "CAN")],
+    ["Precharge time", settings.precharge === undefined ? "–" : `${settings.precharge} s`],
+    ["Device address", settings.device_address ?? "–"],
+    ["Wire resistance per cell", (settings.wire_resistance_mohm || []).join(", ") +
+                                 (settings.wire_resistance_mohm ? " mΩ" : "–")],
   ];
   return "<table>" + rows.map(([k, v]) => `<tr><th>${k}</th><td>${esc(String(v))}</td></tr>`).join("") +
          "</table>";

@@ -36,12 +36,6 @@ esp_err_t uploader_post(const char *url, const char *content_type, const char *b
                         char *resp, size_t resp_size);
 
 /**
- * URL of another dashboard endpoint next to the upload URL, e.g. "firmware"
- * for http://host/api/firmware. False without an upload URL.
- */
-bool uploader_api_url(const char *name, char *url, size_t url_size);
-
-/**
  * Signal strength of the joined network in dBm, 0 when offline.
  */
 int uploader_wifi_rssi(void);

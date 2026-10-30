@@ -200,21 +200,6 @@ int uploader_wifi_rssi(void) {
 }
 
 
-bool uploader_api_url(const char *name, char *url, size_t url_size) {
-#ifdef ENV_JKBMS_UPLOAD_URL
-    // the upload URL ends with /api/status: the other endpoints are next to it
-    const char *slash = strrchr(ENV_JKBMS_UPLOAD_URL, '/');
-    if (slash == NULL) {
-        return false;
-    }
-    snprintf(url, url_size, "%.*s/%s", (int) (slash - ENV_JKBMS_UPLOAD_URL), ENV_JKBMS_UPLOAD_URL, name);
-    return true;
-#else
-    return false;
-#endif
-}
-
-
 esp_err_t uploader_post(const char *url, const char *content_type, const char *body, size_t len,
                         char *resp, size_t resp_size) {
 #ifndef ENV_JKBMS_API_TOKEN

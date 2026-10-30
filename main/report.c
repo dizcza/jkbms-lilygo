@@ -105,11 +105,40 @@ static void add_settings(cJSON *bms, const jkbms_settings_t *s) {
     add_number(o, "max_charge_current", s->max_charge_current);
     add_number(o, "max_discharge_current", s->max_discharge_current);
     add_number(o, "charge_otp", s->charge_otp);
+    add_number(o, "charge_otp_recovery", s->charge_otp_recovery);
     add_number(o, "charge_utp", s->charge_utp);
+    add_number(o, "charge_utp_recovery", s->charge_utp_recovery);
     add_number(o, "discharge_otp", s->discharge_otp);
+    add_number(o, "discharge_otp_recovery", s->discharge_otp_recovery);
     add_number(o, "discharge_utp", s->discharge_utp);
+    add_number(o, "discharge_utp_recovery", s->discharge_utp_recovery);
     add_number(o, "mosfet_otp", s->mosfet_otp);
+    add_number(o, "mosfet_otp_recovery", s->mosfet_otp_recovery);
     cJSON_AddBoolToObject(o, "heating_enabled", s->heating_enabled);
+    add_number(o, "heating_start", s->heating_start);
+    add_number(o, "heating_stop", s->heating_stop);
+    add_number(o, "cell_rcv", s->cell_rcv);
+    add_number(o, "cell_rfv", s->cell_rfv);
+    add_number(o, "charge_ocp_delay", s->charge_ocp_delay_s);
+    add_number(o, "charge_ocp_recovery", s->charge_ocp_recovery_s);
+    add_number(o, "discharge_ocp_delay", s->discharge_ocp_delay_s);
+    add_number(o, "discharge_ocp_recovery", s->discharge_ocp_recovery_s);
+    add_number(o, "scp_delay_us", s->scp_delay_us);
+    add_number(o, "scp_recovery", s->scp_recovery_s);
+    add_number(o, "device_address", s->device_address);
+    add_number(o, "precharge", s->precharge_s);
+    cJSON_AddBoolToObject(o, "disable_temp_sensors", s->disable_temp_sensors);
+    cJSON_AddBoolToObject(o, "gps_heartbeat", s->gps_heartbeat);
+    cJSON_AddBoolToObject(o, "port_rs485", s->port_rs485);
+    cJSON_AddBoolToObject(o, "display_always_on", s->display_always_on);
+    cJSON_AddBoolToObject(o, "special_charger", s->special_charger);
+    cJSON_AddBoolToObject(o, "disable_pcl_module", s->disable_pcl_module);
+    cJSON_AddBoolToObject(o, "timed_stored_data", s->timed_stored_data);
+    cJSON_AddBoolToObject(o, "charging_float_mode", s->charging_float_mode);
+    cJSON *wires = cJSON_AddArrayToObject(o, "wire_resistance_mohm");
+    for (int i = 0; i < s->wire_count; i++) {
+        cJSON_AddItemToArray(wires, cJSON_CreateNumber(s->wire_resistance_mohm[i]));
+    }
 }
 
 
@@ -246,6 +275,15 @@ char* report_add_age(const char *json, uint32_t age_s) {
         snprintf(aged, len, "{\"age\":%lu,%s", (unsigned long) age_s, json + 1);
     }
     return aged;
+}
+
+
+int report_logbook_unsent(int slot, const jkbms_extras_t *x) {
+    const uint32_t sent = m_logbook_sent[slot];
+    if (!x->logbook_valid || sent >= x->logbook_total) {
+        return 0;
+    }
+    return MIN(x->logbook_total - sent, (uint32_t) x->logbook_count);
 }
 
 

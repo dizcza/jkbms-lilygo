@@ -59,11 +59,8 @@ header is crossed out in red while the board is offline.
   update failed. If it does not get back on
   Wi-Fi after the reboot, the next reset rolls back to the previous firmware.
 
-- **Remote maintenance.** The dashboard's reply to each upload can run a command (pick a BMS,
-  reboot) or have the board download a new firmware from the dashboard. A new firmware is kept once the dashboard accepted its first report;
-  otherwise the next reset rolls back to the previous one, which is not tried again.
-  On the VPS: `web/manage.py` (status, BLE devices around, commands);
-  `tools/deploy_firmware.sh` publishes `build/jkbms.bin` to all boards.
+- **No remote control.** The dashboard only receives: it sends the board no commands and no
+  firmware. The firmware is updated only on the board's own page (below), or over USB.
 
 ## Dashboard
 

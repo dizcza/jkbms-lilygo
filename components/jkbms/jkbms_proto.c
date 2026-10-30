@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/param.h>
 
 
 static const char *const m_errors_jk02[32] = {
@@ -336,9 +337,16 @@ bool jkbms_decode_settings(const uint8_t *frame, jkbms_proto_t proto, jkbms_sett
     settings->balance_trigger = get_u32(frame, 26) * 0.001f;
     settings->cell_soc100 = get_u32(frame, 30) * 0.001f;
     settings->cell_soc0 = get_u32(frame, 34) * 0.001f;
+    settings->cell_rcv = get_u32(frame, 38) * 0.001f;
+    settings->cell_rfv = get_u32(frame, 42) * 0.001f;
     settings->power_off = get_u32(frame, 46) * 0.001f;
     settings->max_charge_current = get_u32(frame, 50) * 0.001f;
+    settings->charge_ocp_delay_s = get_u32(frame, 54);
+    settings->charge_ocp_recovery_s = get_u32(frame, 58);
     settings->max_discharge_current = get_u32(frame, 62) * 0.001f;
+    settings->discharge_ocp_delay_s = get_u32(frame, 66);
+    settings->discharge_ocp_recovery_s = get_u32(frame, 70);
+    settings->scp_recovery_s = get_u32(frame, 74);
     settings->max_balance_current = get_u32(frame, 78) * 0.001f;
     settings->charge_otp = (int32_t) get_u32(frame, 82) * 0.1f;
     settings->charge_otp_recovery = (int32_t) get_u32(frame, 86) * 0.1f;
@@ -353,10 +361,30 @@ bool jkbms_decode_settings(const uint8_t *frame, jkbms_proto_t proto, jkbms_sett
     settings->discharge_enabled = frame[122] != 0;
     settings->balancer_enabled = frame[126] != 0;
     settings->capacity = get_u32(frame, 130) * 0.001f;
+    settings->scp_delay_us = get_u32(frame, 134);
     settings->balance_start = get_u32(frame, 138) * 0.001f;
-    if (proto == JKBMS_PROTO_JK02_32S) {
-        settings->heating_enabled = (frame[282] & 0x01) != 0;
-        settings->smart_sleep_enabled = (frame[282] & 0x40) != 0;
+    // balance lead resistances (mOhm): 32 from offset 142 (JK02_32S), 24 from 158 (JK02_24S)
+    const bool is_32s = proto == JKBMS_PROTO_JK02_32S;
+    settings->wire_count = MIN(settings->cell_count, is_32s ? 32 : 24);
+    for (int i = 0; i < settings->wire_count; i++) {
+        settings->wire_resistance_mohm[i] = (uint16_t) MIN(get_u32(frame, (is_32s ? 142 : 158) + 4 * i), UINT16_MAX);
+    }
+    if (is_32s) {
+        settings->device_address = frame[270];
+        settings->precharge_s = frame[274];
+        const uint8_t flags = frame[282];
+        settings->heating_enabled = (flags & 0x01) != 0;
+        settings->disable_temp_sensors = (flags & 0x02) != 0;
+        settings->gps_heartbeat = (flags & 0x04) != 0;
+        settings->port_rs485 = (flags & 0x08) != 0;
+        settings->display_always_on = (flags & 0x10) != 0;
+        settings->special_charger = (flags & 0x20) != 0;
+        settings->smart_sleep_enabled = (flags & 0x40) != 0;
+        settings->disable_pcl_module = (flags & 0x80) != 0;
+        settings->timed_stored_data = (frame[283] & 0x01) != 0;
+        settings->charging_float_mode = (frame[283] & 0x02) != 0;
+        settings->heating_start = (int8_t) frame[284];
+        settings->heating_stop = (int8_t) frame[285];
         settings->smart_sleep_delay_h = frame[286];
         settings->discharge_utp = (int8_t) frame[296];
         settings->discharge_utp_recovery = (int8_t) frame[297];

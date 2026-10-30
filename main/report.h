@@ -37,6 +37,11 @@ char* report_build_logbook(int slot, const jkbms_extras_t *extras);
 void report_logbook_sent(int slot);
 
 /**
+ * The number of logbook events not delivered yet.
+ */
+int report_logbook_unsent(int slot, const jkbms_extras_t *extras);
+
+/**
  * A copy of the status report `json` with its age, for a report sent later
  * than it was built; the dashboard dates its values back. Free it with free().
  */
